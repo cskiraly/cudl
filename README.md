@@ -153,6 +153,22 @@ template it copies into new labs (`template/`) and end-to-end tests on real git 
 (`python3 -m unittest discover tests`). Not built yet: a summarizer for sessions that ended without
 a wrap.
 
+## Feedback
+
+Your agents note what gets in their way with cudl: `cudl feedback "…"` writes each note as a file in
+the main lab's `notes/cudl-feedback/` and commits it there. It stays in your lab: cudl never sends
+anything anywhere, and the lab's instructions tell the agents never to post it.
+
+To pass a note on to cudl's maintainers, do it yourself, by hand:
+
+1. Remove anything private from the file: the names of your projects, files, hosts or people,
+   paths, anything you wouldn't publish. Edit the file itself, since the links below carry its text
+   to GitHub as soon as you open them.
+2. Run `cudl feedback --link notes/cudl-feedback/<file>.md`. It prints a search of the existing
+   issues: if one already covers your note, add to it rather than opening another.
+3. Otherwise open the new issue it prints, pre-filled with the note, check it once more, and submit
+   it.
+
 ## Read more
 
 - [FEATURES.md](FEATURES.md): everything cudl does, area by area.

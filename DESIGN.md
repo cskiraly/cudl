@@ -350,7 +350,11 @@ destructive, clean worktrees before removal, and a main lab with no pending chan
 - **`push`** says what it pushes (integration branches; `--feature <f>` for a feature's branches,
   `--remote` to choose where) and pushes with `--no-follow-tags`: branches only, never tags or keep
   refs. **`feedback`** writes one file per entry under the main lab's `notes/cudl-feedback/` and
-  commits it there, so nothing diverges across features. **`new --from`** a parent with
+  commits it there, so nothing diverges across features. It sends nothing: agents write with the
+  work's context at hand, private details included. `feedback --link <entry>` gives the user a
+  search of cudl's issues and a pre-filled new issue for an entry they cleaned; a link carries its
+  text to GitHub when opened, so none is printed when an entry is recorded, and only entries in
+  `notes/cudl-feedback/` are read (`feedback` runs without asking). **`new --from`** a parent with
   uncommitted changes starts from its last commit, and says so.
 - The code review found, and these were fixed: `upgrade` dropped the old marker's record of an
   edited `AGENTS.md` (then migrated once, a migration dropped since; and a shallow tool history

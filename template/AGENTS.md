@@ -46,6 +46,9 @@ the memory, journal and handoffs.
   <feature> --rebase` moves the feature's own commits onto it; with `--force` (published commits)
   it's the user's call, like any `--force`.
 - Feedback about cudl itself: `.cudl/cudl feedback "…"` (one file per entry, in the main lab).
+  Write it about cudl, with no names, paths or other private details of the work, and tell the user
+  you recorded it. Passing it on to cudl's maintainers is the user's, by hand: never open the links
+  `feedback --link` prints, and never post an issue yourself.
 
 ## Started by another agent
 

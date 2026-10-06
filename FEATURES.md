@@ -37,7 +37,7 @@ it; [DESIGN.md](DESIGN.md) explains why it is built this way.
 
 - Plain git works in the lab and in `code/*`: lab git hooks keep every pinned commit, and the session-end hook records code commits nobody pinned yet.
 - One session can work across features: `cudl <command> -f <feature>` from anywhere (`-f` after the command: the form the agents' permission rules allow); the session gets a linked log in each feature where it changes something through cudl, or resumes, and `/wrap` covers them all.
-- `cudl feedback "…"` records a note about cudl as its own file in the main lab.
+- `cudl feedback "…"` records a note about cudl as its own file in the main lab; nothing is sent. `cudl feedback --link <entry>` prints, for you to use by hand once the entry is free of private details, a search of cudl's issues and a new issue pre-filled with it. Agents are told never to open these links or post issues.
 - `cudl push --feature <f> [--remote fork]` pushes a feature's code branches; pushes are branches only, never tags.
 
 ## Committing at both levels

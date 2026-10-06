@@ -400,6 +400,45 @@ class TestLab(CudlTest):
         self.assertEqual(list((self.w / ".git").glob("cudl-*.tmp")), [])
         self.assertTrue(self.clean(self.w))
 
+    # --- feedback to cudl's maintainers: by hand, cleaned, after a search ---
+
+    def test_feedback_says_how_to_send_it_by_hand(self):
+        out = self.cudl("feedback", "sync was confusing").stdout
+        self.assertIn("never sends", out)
+        self.assertIn("private", out)
+        self.assertIn("feedback --link notes/cudl-feedback/", out)
+        self.assertNotIn("issues/new", out)  # a link carries the text to GitHub: only once it's clean
+
+    def test_feedback_link_searches_first_and_prefills_a_new_issue(self):
+        self.cudl("feedback", "sync was confusing: it merged twice", "--title", "sync merged twice")
+        entry = next((self.w / "notes/cudl-feedback").glob("*-sync-merged-twice.md"))
+        rel = str(entry.relative_to(self.w))
+        out = self.cudl("feedback", "--link", rel).stdout
+        search = next(l for l in out.split() if "/issues?" in l)
+        self.assertIn("q=is%3Aissue+sync+merged+twice", search)
+        new = next(l for l in out.split() if "/issues/new?" in l)
+        self.assertIn("title=sync+merged+twice", new)
+        self.assertIn("it+merged+twice", new)
+        self.assertNotIn("session", new)  # the line naming the lab and the session stays out
+        self.assertLess(out.index(search), out.index(new))
+        # a long entry: the link stays short enough for a browser and says it was cut
+        entry.write_text("# long\n\n" + "word " * 4000 + "\n")
+        new = next(l for l in self.cudl("feedback", "--link", rel).stdout.split() if "/issues/new?" in l)
+        self.assertLess(len(new), 8000)
+        self.assertIn("cut", new)
+
+    def test_feedback_link_reads_only_feedback_entries(self):
+        (self.w / "notes/other.md").write_text("# not feedback\n\nprivate\n")
+        secret = self.root / "secret.md"
+        secret.write_text("# secret\n\na key\n")
+        link = self.w / "notes/cudl-feedback"
+        link.mkdir(parents=True)
+        (link / "leak.md").symlink_to(secret)
+        for path in ("notes/other.md", str(secret), "notes/cudl-feedback/leak.md", "notes/cudl-feedback/none.md"):
+            p = self.cudl("feedback", "--link", path, check=False)
+            self.assertNotEqual(p.returncode, 0, path)
+            self.assertNotIn("issues/new", p.stdout, path)
+
 
 if __name__ == "__main__":
     unittest.main()

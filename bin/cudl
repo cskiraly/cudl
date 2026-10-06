@@ -43,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
@@ -4258,9 +4259,53 @@ def cmd_ls(a):
             print(f"  {n.get('time', '?')}: " + str(n.get("text", "")).replace("\n", "\n    "))
 
 
+ISSUES = "https://github.com/cskiraly/cudl/issues"  # where cudl's maintainers read feedback
+ISSUE_LINK_MAX = 6000  # a new-issue link this long still opens in browsers and on GitHub
+PRIVATE = "names of your projects, files, hosts or people; paths; anything you wouldn't publish"
+
+
+def feedback_entry(w, path):
+    """A recorded entry, to be read into links: only a file in the main lab's notes/cudl-feedback/, where a
+    link points counting. `feedback` runs without asking, so it must not turn other files into links."""
+    d = (w.main / "notes" / "cudl-feedback").resolve()
+    f = Path(path) if Path(path).is_absolute() or Path(path).exists() else w.main / path
+    f = f.resolve()
+    if not f.is_file() or f.parent != d or f.suffix != ".md":
+        raise CudlError(f"--link {path}: not a feedback entry (a file in the main lab's notes/cudl-feedback/)")
+    return f
+
+
+def issue_links(f):
+    """A search of cudl's issues for the entry's title, and a new issue pre-filled with the entry, without
+    the line cudl wrote under its title (where and when it was recorded: a feature, a session)."""
+    lines = f.read_text().splitlines()
+    title = lines[0][2:].strip() if lines and lines[0].startswith("# ") else f.stem
+    body = "\n".join(l for l in (lines[1:] if lines and lines[0].startswith("# ") else lines)
+                     if not re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} · from ", l)).strip()
+    search = f"{ISSUES}?" + urllib.parse.urlencode({"q": f"is:issue {title}"})
+    new, cut = f"{ISSUES}/new?" + urllib.parse.urlencode({"title": title, "body": body}), ""
+    while len(new) > ISSUE_LINK_MAX and body:
+        body, cut = body[:len(body) * 9 // 10], "\n\n(cut here: the rest is in the entry, in the lab)"
+        new = f"{ISSUES}/new?" + urllib.parse.urlencode({"title": title, "body": body + cut})
+    return search, new
+
+
 def cmd_feedback(a):
-    """A dated note about cudl itself, as its own file in the main lab (no shared file to diverge)."""
+    """A dated note about cudl itself, as its own file in the main lab (no shared file to diverge). Nothing
+    is sent: --link prints, for the user, how to pass a cleaned entry on to cudl's maintainers."""
     w = Lab.find()
+    if a.link:
+        f = feedback_entry(w, a.link)
+        search, new = issue_links(f)
+        print(f"For the user, by hand (cudl never sends anything, and an agent never opens these links or "
+              f"posts an issue):\n"
+              f"  1. make sure {f.relative_to(w.main.resolve())} holds nothing private ({PRIVATE}):\n"
+              f"     these links carry its text to GitHub;\n"
+              f"  2. search the existing issues, and add to one that already covers it rather than open another:\n"
+              f"     {search}\n"
+              f"  3. otherwise open this new issue, pre-filled with the entry, check it, and submit it:\n"
+              f"     {new}")
+        return
     text = " ".join(a.text).strip() or (sys.stdin.read().strip() if not sys.stdin.isatty() else "")
     if not text:
         raise CudlError('what? cudl feedback "<text>"')
@@ -4283,7 +4328,11 @@ def cmd_feedback(a):
     with lab_lock(w):
         git_retry(w.main, "add", "--", rel)
         git_retry(w.main, "commit", "-q", "-m", f"cudl feedback: {title}", "--", rel)
-    print(f"recorded {rel} in the main lab")
+    print(f"recorded {rel} in the main lab. It stays there: cudl never sends anything.\n"
+          f"Passing it on to cudl's maintainers is the user's to do, by hand, never an agent's:\n"
+          f"  1. edit the file to remove anything private ({PRIVATE});\n"
+          f"  2. run `cudl feedback --link {rel}`: it prints a search of the existing issues, to add to one\n"
+          f"     that already covers it, and a new issue pre-filled with the entry.")
 
 
 def cmd_index(a):
@@ -4503,9 +4552,12 @@ def main(argv=None):
     p.add_argument("--codex-sessions", help="Codex sessions directory (default: ~/.codex/sessions)")
     p.set_defaults(fn=cmd_import_sessions)
 
-    p = command("feedback", here_too=True, help="record a note about cudl itself (a file in the main lab's notes/cudl-feedback/)")
+    p = command("feedback", here_too=True, help="record a note about cudl itself (a file in the main lab's "
+                "notes/cudl-feedback/); nothing is sent: --link prints how you pass a cleaned entry on, by hand")
     p.add_argument("text", nargs="*")
     p.add_argument("--title")
+    p.add_argument("--link", metavar="ENTRY", help="for a recorded entry, once you removed anything private from "
+                   "it: a search of cudl's issues, and a new issue pre-filled with it, to submit yourself")
     p.set_defaults(fn=cmd_feedback)
 
     p = command("index", here_too=True, help="rebuild journal/INDEX.md")
