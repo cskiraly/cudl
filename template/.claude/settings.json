@@ -1,0 +1,65 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.cudl/cudl status:*)",
+      "Bash(.cudl/cudl ls)",
+      "Bash(.cudl/cudl index:*)",
+      "Bash(.cudl/cudl commit:*)",
+      "Bash(.cudl/cudl take:*)",
+      "Bash(.cudl/cudl sync:*)",
+      "Bash(.cudl/cudl squash:*)",
+      "Bash(.cudl/cudl keep:*)",
+      "Bash(.cudl/cudl new:*)",
+      "Bash(.cudl/cudl feedback:*)"
+    ],
+    "ask": [
+      "Bash(.cudl/cudl * --force*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "d=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; while [ ! -x \"$d/.cudl/cudl\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; exec \"$d/.cudl/cudl\" hook session-start --agent claude",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "d=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; while [ ! -x \"$d/.cudl/cudl\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; exec \"$d/.cudl/cudl\" hook session-end --agent claude",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "d=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; while [ ! -x \"$d/.cudl/cudl\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; exec \"$d/.cudl/cudl\" hook worktree-create",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "d=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; while [ ! -x \"$d/.cudl/cudl\" ] && [ \"$d\" != / ]; do d=$(dirname \"$d\"); done; exec \"$d/.cudl/cudl\" hook worktree-remove",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
