@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import unittest
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # helpers.py, however the tests run
@@ -438,6 +439,36 @@ class TestLab(CudlTest):
             p = self.cudl("feedback", "--link", path, check=False)
             self.assertNotEqual(p.returncode, 0, path)
             self.assertNotIn("issues/new", p.stdout, path)
+
+    def test_feedback_link_searches_the_whole_words_of_a_cut_title(self):
+        # a title cut at 60 characters ends in "…" inside a word; a search wants every word, that one too
+        self.cudl("feedback", "cudl new with commit signing on and a dead inherited SSH agent socket fails")
+        entry = next((self.w / "notes/cudl-feedback").glob("*.md"))
+        self.assertTrue(entry.read_text().splitlines()[0].endswith(" ag…"))
+        out = self.cudl("feedback", "--link", str(entry.relative_to(self.w))).stdout
+        search = urllib.parse.parse_qs(urllib.parse.urlsplit(next(l for l in out.split() if "/issues?" in l)).query)
+        self.assertEqual(search["q"], ["is:issue cudl new with commit signing on"])
+        new = urllib.parse.parse_qs(urllib.parse.urlsplit(next(l for l in out.split() if "/issues/new?" in l)).query)
+        self.assertEqual(new["title"], ["cudl new with commit signing on and a dead inherited SSH…"])
+
+    def test_feedback_link_from_a_feature_reads_the_main_labs_entry(self):
+        self.cudl("feedback", "sync merged twice", "--title", "sync merged twice")
+        self.cudl("new", "f1")
+        entry = next((self.w / "notes/cudl-feedback").glob("*.md"))
+        rel = str(entry.relative_to(self.w))
+        self.assertTrue((self.w / "wt/f1" / rel).exists())  # the feature has the copy main had when it began
+        entry.write_text("# sync merged twice\n\ncleaned by the user\n")
+        out = self.cudl("feedback", "--link", rel, cwd=self.w / "wt/f1").stdout
+        self.assertIn("cleaned+by+the+user", out)
+
+    def test_feedback_link_takes_no_text(self):
+        self.cudl("feedback", "sync merged twice", "--title", "sync merged twice")
+        rel = str(next((self.w / "notes/cudl-feedback").glob("*.md")).relative_to(self.w))
+        for extra in (["more text"], ["--title", "other"]):
+            p = self.cudl("feedback", *extra, "--link", rel, check=False)
+            self.assertNotEqual(p.returncode, 0, extra)
+            self.assertIn("--link", p.stderr)
+        self.assertEqual(len(list((self.w / "notes/cudl-feedback").glob("*.md"))), 1)
 
 
 if __name__ == "__main__":

@@ -354,7 +354,9 @@ destructive, clean worktrees before removal, and a main lab with no pending chan
   work's context at hand, private details included. `feedback --link <entry>` gives the user a
   search of cudl's issues and a pre-filled new issue for an entry they cleaned; a link carries its
   text to GitHub when opened, so none is printed when an entry is recorded, and only entries in
-  `notes/cudl-feedback/` are read (`feedback` runs without asking). **`new --from`** a parent with
+  the main lab's `notes/cudl-feedback/` are read (`feedback` runs without asking), even from a feature
+  whose worktree has older copies. The search takes the title's first six whole words: GitHub wants
+  every word, and a whole title, cut at 60 characters, finds only itself. **`new --from`** a parent with
   uncommitted changes starts from its last commit, and says so.
 - The code review found, and these were fixed: `upgrade` dropped the old marker's record of an
   edited `AGENTS.md` (then migrated once, a migration dropped since; and a shallow tool history

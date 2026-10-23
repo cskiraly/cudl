@@ -78,7 +78,8 @@ def feedback_entry(w, path):
     """A recorded entry, to be read into links: only a file in the main lab's notes/cudl-feedback/, where a
     link points counting. `feedback` runs without asking, so it must not turn other files into links."""
     d = (w.main / "notes" / "cudl-feedback").resolve()
-    f = Path(path) if Path(path).is_absolute() or Path(path).exists() else w.main / path
+    # relative to the main lab first: a feature's worktree holds older copies of the entries at the same paths
+    f = Path(path) if Path(path).is_absolute() or not (w.main / path).exists() else w.main / path
     f = f.resolve()
     if not f.is_file() or f.parent != d or f.suffix != ".md":
         raise CudlError(f"--link {path}: not a feedback entry (a file in the main lab's notes/cudl-feedback/)")
@@ -92,7 +93,10 @@ def issue_links(f):
     title = lines[0][2:].strip() if lines and lines[0].startswith("# ") else f.stem
     body = "\n".join(l for l in (lines[1:] if lines and lines[0].startswith("# ") else lines)
                      if not re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} · from ", l)).strip()
-    search = f"{ISSUES}?" + urllib.parse.urlencode({"q": f"is:issue {title}"})
+    if title.endswith("…"):  # cut by one_line, inside a word: keep the whole words
+        title = title[:-1].rsplit(" ", 1)[0] + "…"
+    # a search wants every word: the first few find an issue on the same thing, the whole title only itself
+    search = f"{ISSUES}?" + urllib.parse.urlencode({"q": "is:issue " + " ".join(title.rstrip("…").split()[:6])})
     new, cut = f"{ISSUES}/new?" + urllib.parse.urlencode({"title": title, "body": body}), ""
     while len(new) > ISSUE_LINK_MAX and body:
         body, cut = body[:len(body) * 9 // 10], "\n\n(cut here: the rest is in the entry, in the lab)"
@@ -105,6 +109,8 @@ def cmd_feedback(a):
     is sent: --link prints, for the user, how to pass a cleaned entry on to cudl's maintainers."""
     w = Lab.find()
     if a.link:
+        if a.text or a.title:
+            raise CudlError("--link prints the links for an entry already recorded: give it no text or --title")
         f = feedback_entry(w, a.link)
         search, new = issue_links(f)
         print(f"For the user, by hand (cudl never sends anything, and an agent never opens these links or "
