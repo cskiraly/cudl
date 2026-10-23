@@ -198,8 +198,30 @@ def has_staged(d):
     return not git_ok(d, "diff", "--cached", "--quiet")
 
 
-def pinned(top, path):
-    return run(GIT + ["rev-parse", f"HEAD:{path}"], top, check=False).stdout.strip() or None
+def pinned(top, path, ref="HEAD"):
+    """The commit `ref` pins at path, or None where its tree has no such path (without --verify, git
+    prints the argument back)."""
+    return run(GIT + ["rev-parse", "-q", "--verify", f"{ref}:{path}"], top, check=False).stdout.strip() or None
+
+
+def history_pins(top, ref, path):
+    """Every commit `ref`'s history pinned at path: side branches too (--full-history), and what merges
+    resolved (-m)."""
+    out = git(top, "log", "--full-history", "-m", "--raw", "--no-abbrev", "--no-renames", "--format=", ref,
+              "--", path, check=False)
+    return {x for line in out.splitlines() for x in line.split()[2:4] if x.strip("0")}
+
+
+def stale_pin(top, ref, path, sha):
+    """sha is a pin `ref` had and has since left: a merge's leftover in a feature, never its own pin."""
+    now = pinned(top, path, ref)
+    return bool(now) and sha != now and sha in history_pins(top, ref, path)
+
+
+def index_pins(top, path):
+    """path's gitlink in the index, by stage: '0', or '1' to '3' in a conflict."""
+    out = git(top, "ls-files", "-s", "--", path, check=False)
+    return {f[2]: f[1] for f in (line.split() for line in out.splitlines()) if f[0] == "160000"}
 
 
 def is_ancestor(d, a, b):

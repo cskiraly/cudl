@@ -792,6 +792,31 @@ share, and not worth it while memories are one file each.
 Each repo has one integration branch, recorded in `.gitmodules` (`submodule.<name>.branch`);
 `cudl new --base <repo>=<branch>` overrides it for one feature, with another local branch.
 
+**The pins of repos a feature doesn't own** (a lab's feedback, 2026-10-12: finishes had put main's
+older pin of a repo back). Git moves no submodule checkout in a merge, `submodule.recurse` or not,
+conflicted or clean; and a commit of everything (`cudl commit`'s `git add -A`, `git commit -a`)
+stages each checkout as it is. A sync whose lab merge stopped on a conflict left the detached
+checkouts at the old pins, the commit that concluded the merge recorded them, and from then on the
+feature's branch "changed" the pin: a later gitlink conflict resolved to the checkout, a merge with
+main kept it, and `finish` put it back into main. The rule now: a feature's pin of a repo it doesn't
+own that the branch it follows (main, or the live parent) had once and has since left is *stale*, a
+merge's leftover, never the feature's choice. A pin the feature made (a commit made on the detached
+checkout, or one the lab never pinned) stays its own, as before.
+- `sync` brings the detached checkouts to the index's pins right after its lab merge, before the
+  merge is committed or stops on a conflict; a stale pin becomes the followed branch's, also with
+  nothing to merge (it repairs branches an older cudl left); in a gitlink conflict, ours unless
+  it's stale.
+- `commit` in a feature moves a detached checkout that differs from the index's pin and sits at a pin
+  the lab's history had (a merge, a checkout or a reset of the lab left it behind) instead of
+  recording it; during a merge, as `sync` against `MERGE_HEAD`. A checkout with changes to tracked
+  files (or one the checkout would overwrite) stays, with a line saying the lab records it until it
+  moves; untracked files go along. During a merge, `commit` refuses unresolved files (pins and the
+  index are cudl's to resolve) and `--lab` (a pathspec commit can't conclude a merge), before
+  anything changes; a merge whose result is `HEAD`'s tree is still committed.
+- `finish` refuses when the lab merge would put an older pin of main's back (`merge-tree`): the
+  feature's own tip may be older than main's pin, which only matters if the merge would take it.
+  `cudl sync` repairs it.
+
 ## The `cudl` tool
 
 A single stdlib-only Python script, with skills on top, for the chores of the two-level git.
@@ -804,7 +829,7 @@ its hooks reconcile what plain git did (see "A helper, not a gatekeeper").
 | `cudl open <feat>` | a tmux window in that worktree running `claude`: one command per parallel session |
 | `cudl ls` | every feature: branches, dirty state at both levels, ahead/behind, last session and its outcome |
 | `cudl commit -m …` | commit each dirty code repo, then the lab with the pointer bumps and artifacts |
-| `cudl sync` | in a feature: merge the integration branches into the feature's code branches and main into `feat/<feat>`, move pinned repos to main's pins |
+| `cudl sync` | in a feature: merge the integration branches into the feature's code branches and main into `feat/<feat>`, move pinned repos to main's pins (an older pin of main's left by an earlier merge too) |
 | `cudl finish <feat>` | merge the code branches (fast-forward or merge, never a detached HEAD), merge the lab branch, rebuild indexes, remove the worktrees |
 | `cudl push` | push code branches only, after checking them; the lab stays local |
 | `cudl take <repo>` | in a feature, start a branch in a repo that was pinned |
@@ -1014,6 +1039,14 @@ Open:
   allow rules to the lab's own copy by its full path, which changes how agents call cudl.
 - Not checked: Codex started from Codex; whether a running session sees the memories another session
   wrote since it started.
+- The pins of repos a feature doesn't own ("Parallel features"): a feature that wants an older pin
+  main once had, of a repo it doesn't own, gets main's back at each sync, and `commit` moves a checkout
+  at a pin the lab's history had back to the lab's pin (stage it by hand, `git add code/<repo>`, to
+  record it); to hold one, take the repo, or pin it in main. The history is the evidence: after a
+  rewrite of the lab's history (a reset to before a pin), a checkout at a pin that history no longer
+  has counts as the feature's own and is recorded. A repo the feature owned once and has back on a
+  detached checkout is treated like one it never owned (switch back to its branch). In the main lab,
+  a lab merge by hand followed by `cudl commit` still records the integration checkouts as they are.
 - The known limits in "Sessions: what cudl promises" and "Worktree exits, notices and the memory
   index".
 

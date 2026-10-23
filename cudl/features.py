@@ -5,14 +5,15 @@
 import argparse
 import datetime
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
 
 from cudl.core import (
     AGENTS, CudlError, GIT, busy, changed_paths, conflicted, git, git_ok, git_retry, has_staged,
-    head_branch, head_sha, in_progress, is_ancestor, is_checkout, lab_changes, lab_lock, pinned,
-    pinned_head, porcelain, run, short,
+    head_branch, head_sha, history_pins, in_progress, index_pins, is_ancestor, is_checkout, lab_changes,
+    lab_lock, pinned, pinned_head, porcelain, run, short, stale_pin,
 )
 from cudl.lab import (
     KEEP, Lab, base_of, base_problem, keep_since, lab_tops, require_feature, setup_local,
@@ -60,14 +61,19 @@ def cmd_new(a, quiet=False):
                   + f"; {feat} starts from its last commits (commit them in {parent}, then "
                   f"`cudl sync -f {feat}` to bring them in)", file=sys.stderr)
         parent_owned = [r.name for r in repos.values() if head_branch(ptop / r.path) == parent]
+    # repos main added after the parent was made: its lab doesn't have them yet, so neither does this one
+    later = [r.name for r in repos.values() if parent and not pinned(main, r.path, f"refs/heads/feat/{parent}")]
     sel = [x for item in (a.repo or []) for x in item.split(",") if x]
     if a.all:
-        sel = list(repos)
+        sel = [n for n in repos if n not in later]
     elif parent and not sel:
         sel = list(parent_owned)
     for name in sel:
         if name not in repos:
             raise CudlError(f"unknown repo {name}; known: {', '.join(repos) or 'none'}")
+        if name in later:
+            raise CudlError(f"{name} isn't in {parent}'s lab yet (main added it later): `cudl sync -f {parent}` "
+                            f"brings it in, then make {feat}; or make {feat} without it and take it after both syncs")
     bases = {}
     for spec in a.base or []:
         name, _, branch = spec.partition("=")
@@ -110,6 +116,8 @@ def cmd_new(a, quiet=False):
         if lab_cfg(w, parent, "cudlid"):
             git(main, "config", f"branch.feat/{feat}.cudlparentid", lab_cfg(w, parent, "cudlid"))
     for r in repos.values():
+        if r.name in later:
+            continue
         target = top / r.path
         if target.is_dir() and not any(target.iterdir()):
             target.rmdir()
@@ -141,6 +149,9 @@ def cmd_new(a, quiet=False):
         owned = ", ".join(sel) or "none (all repos pinned; `cudl take <repo>` to work on one)"
         print(f"feature {feat} at {top}" + (f", stacked on {parent}" if parent else "")
               + f"\n  branches: feat/{feat} in the lab, {feat} in: {owned}\n  open a session: cudl open {feat}")
+    if later:
+        print(f"note: {', '.join(later)} isn't in {parent}'s lab yet (main added it later); it comes in when "
+              f"{parent} syncs with main (cudl sync -f {parent}) and then {feat} does", file=sys.stderr)
     return top
 
 
@@ -152,7 +163,9 @@ def check_out_pinned(w, top, r):
         raise CudlError(f"{r.path} is not checked out in the main lab: git submodule update --init")
     if target.is_dir() and not any(target.iterdir()):
         target.rmdir()
-    pin = pinned(top, r.path) or head_sha(src)
+    pin = pinned(top, r.path)
+    if not pin:
+        raise CudlError(f"{r.path} isn't in this lab's tree")
     git(src, "worktree", "add", "-q", "--detach", str(target), pin)
     return pin
 
@@ -292,6 +305,15 @@ def cmd_commit(a):
         if not (per.get(r.name) or default):
             problems.append(f"no message for {r.name}: -m <msg> or -m {r.name}=<msg>")
     problems += [f"--lab {p}: no such path in the lab" for p in a.lab or [] if not lab_path_known(w.top, p)]
+    merging = git_ok(w.top, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+    if a.lab and merging:
+        problems.append("the lab is in the middle of a merge: commit it whole, without --lab")
+    # a file edited to resolve it is still unmerged to git until added: what counts is a marker left in it;
+    # pins and the index are cudl's to resolve
+    stuck = [c for c in conflicted(w.top) if c not in {r.path for r in repos.values()} | {"journal/INDEX.md"}
+             and conflict_markers(w.top / c)] if merging else []
+    if stuck:
+        problems.append(f"the lab has unresolved conflicts: {', '.join(stuck[:5])}: resolve them first")
     if problems:
         raise CudlError("nothing committed:\n  " + "\n  ".join(problems))
     link_session(w)
@@ -313,6 +335,8 @@ def cmd_commit(a):
         print(f"{r.name}: {short(head_sha(d))} on {head_branch(d)}")
 
     with lab_lock(w):  # against concurrent session-end and feedback commits
+        if w.feature:  # a checkout a merge left behind isn't a pin to record
+            follow_pins(w, repos, "MERGE_HEAD" if merging else None, "the merged branch")
         if a.lab:  # only these paths: the index lists the logs the commit holds, not a running session's
             build_commit_index(w.top, [p for p in changed_paths(w.top, *a.lab, literal=False)
                                        if p.startswith("journal/sessions/")])
@@ -330,7 +354,8 @@ def cmd_commit(a):
                 git(w.top, "add", "--", *there)
         else:
             git(w.top, "add", "-A")
-        if (only and not git_ok(w.top, "diff", "--cached", "--quiet", "--", *only)) or (not only and has_staged(w.top)):
+        if (only and not git_ok(w.top, "diff", "--cached", "--quiet", "--", *only)) or \
+                (not only and (has_staged(w.top) or merging)):
             trailers = []
             for r in repos.values():
                 d = w.top / r.path
@@ -435,6 +460,48 @@ def check_clean(fw, what, ignore=()):
         problems.append("the lab has uncommitted changes (or unrecorded code commits)")
     if problems:
         raise CudlError(f"{what}: commit first (cudl commit):\n  " + "\n  ".join(problems))
+
+
+def conflict_markers(f):
+    """A conflict's markers left in a file."""
+    try:
+        return bool(re.search(r"^(<{7}|>{7})( |$)", f.read_text(errors="replace"), re.M))
+    except OSError:
+        return False
+
+
+def follow_pins(w, repos, ref=None, name=None):
+    """Each repo the feature doesn't own (checked out detached) to the lab's pin: the index's, or ours in
+    a gitlink conflict; a pin `ref` had and has since left (an earlier merge's leftover, never the
+    feature's own) becomes ref's. Git moves no checkout in a merge, and a commit of everything stages
+    the checkouts: one left behind would put an older pin back. A checkout at a commit the lab never
+    pinned is the user's (`commit` records it) and stays; so does one with changes in it, with a line.
+    `repos` as read before a merge: a conflicted .gitmodules yields none. Under the lab lock."""
+    for r in repos.values():
+        d = w.top / r.path
+        if not is_checkout(d) or head_branch(d):
+            continue
+        stages = index_pins(w.top, r.path)
+        pin = older = stages.get("0") or stages.get("2")
+        if not pin:
+            continue
+        if ref and stale_pin(w.top, ref, r.path, pin):
+            pin = pinned(w.top, r.path, ref)
+        cur = head_sha(d)
+        if cur != pin and cur not in history_pins(w.top, "HEAD", r.path):
+            continue
+        if pin != older:
+            print(f"{r.name}: {short(older)} is an older pin of {name or ref}'s; taking its {short(pin)}")
+        if cur != pin:
+            # untracked files go along; changes to tracked ones, or one the checkout would overwrite, stop it
+            if busy(d) or porcelain(d, untracked=False) or \
+                    run(GIT + ["checkout", "-q", "--detach", pin], d, check=False).returncode:
+                print(f"{r.name}: left at {short(cur)}, not the lab's pin {short(pin)}, for the changes in it; "
+                      f"the lab records {short(cur)} until it moves (git -C {d} checkout --detach {short(pin)})")
+                continue
+            print(f"{r.name}: pinned at {short(pin)}")
+        if stages.get("0") != pin:
+            git(w.top, "add", "--", r.path)
 
 
 def record_moved_pins(w, why):
@@ -593,8 +660,10 @@ def sync_feature(w, rebase=False, force=False, reparent_abandoned=False, link=Tr
             git(d, "config", f"branch.{feat}.cudlparenttip", sha)
     main_branch = f"feat/{parent}" if parent else (head_branch(w.main) or "main")
     with lab_lock(w):
-        if not is_ancestor(w.top, main_branch, "HEAD"):
-            p = run(GIT + ["merge", "--no-edit", main_branch], w.top, check=False)
+        merging = not is_ancestor(w.top, main_branch, "HEAD")
+        p = run(GIT + ["merge", "--no-edit", main_branch], w.top, check=False) if merging else None
+        follow_pins(w, repos, main_branch)  # before the merge is committed or stops: whatever commits it records these pins
+        if merging:
             if p.returncode != 0:
                 remaining = resolve_generated(w.top, conflicted(w.top), repos)
                 if remaining:
@@ -610,13 +679,6 @@ def sync_feature(w, rebase=False, force=False, reparent_abandoned=False, link=Tr
                     print(f"note: {r.name} isn't checked out here: {e}", file=sys.stderr)
                     continue
                 print(f"{r.name}: checked out at {short(pin)}, pinned (`cudl take {r.name}` to work on it)")
-        for r in repos.values():
-            d = w.top / r.path
-            if is_checkout(d) and not head_branch(d):
-                pin = pinned(w.top, r.path)
-                if pin and pin != head_sha(d):
-                    git(d, "checkout", "-q", "--detach", pin)
-                    print(f"{r.name}: pinned at {short(pin)}")
         build_index(w.top)
         git(w.top, "add", "-A")
         if has_staged(w.top):

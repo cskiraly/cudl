@@ -17,6 +17,7 @@ it; [DESIGN.md](DESIGN.md) explains why it is built this way.
 
 - `cudl new <feat> -r <repos>` creates a lab worktree on branch `feat/<feat>`. Each listed repo's `code/<repo>` is a worktree of the shared submodule, so all features share one object store per repo.
 - Repos a feature doesn't own are checked out read-only at the lab's pinned commit. `cudl take <repo>` gives one a feature branch. A repo main adds later comes in with `sync`, checked out the same way (`take` checks out one an older cudl's sync left empty).
+- Their pins follow main (or the parent): `sync` moves their checkouts before a lab merge is committed or stops on a conflict, `commit` moves a checkout a merge left behind rather than record it, `sync` replaces an older pin of main's that an earlier merge left on the branch, and `finish` refuses to put one back into main.
 - A feature follows a base in each repo it owns: the integration branch, or another local branch given with `new --base <repo>=<branch>` (or `take --base`). A remote-tracking branch is refused, with the command that makes a local one; a feature recorded with one (older cudl took it) gets the repair from `sync` and `finish`.
 - `cudl open <feat> [--agent claude|codex]` starts an agent session in a tmux window.
 - `cudl ls` and `cudl status` show every feature at both levels: branches, ahead/behind, uncommitted changes, code commits the lab hasn't recorded, and the last session.
@@ -29,7 +30,7 @@ it; [DESIGN.md](DESIGN.md) explains why it is built this way.
 
 - Every code commit the lab's history pins is kept (`refs/cudl/keep/<sha>`), so squashing, rebasing or amending a feature branch never breaks old lab commits; `cudl keep --check` audits it.
 - `cudl squash` folds a feature's commits into one; it refuses commits already on any remote.
-- `cudl new <child> --from <feature>` stacks a feature on an unfinished one: its plans, notes, handoff and code branches. `sync` follows the parent, and once the parent is finished, wherever the parent was merged.
+- `cudl new <child> --from <feature>` stacks a feature on an unfinished one: its plans, notes, handoff and code branches. `sync` follows the parent, and once the parent is finished, wherever the parent was merged. A repo main added after the parent was made comes in once the parent and then the child sync.
 - When the parent was rewritten (squashed, amended), `sync` stops and `cudl sync --rebase` moves the child's own commits onto it. It refuses published commits without `--force` and merges that a rebase would lose, and a rebase finished by hand is recognised.
 - `cudl finish --stack <top>` finishes a whole stack bottom-up, syncing each level first. It checks every level before it starts and is resumable after a stop.
 

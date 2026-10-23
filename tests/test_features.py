@@ -387,6 +387,216 @@ class TestFeatures(CudlTest):
         self.assertIn("gamma: checked out", self.cudl("sync", "-f", "f3").stdout)
         self.assertEqual(self.head(self.w / "wt/f3/code/gamma"), self.pin(self.w / "wt/f3", "code/gamma"))
 
+    def test_new_from_a_parent_without_a_repo_main_added_since(self):
+        """A lab's feedback: `new --from` stopped at 'invalid reference: HEAD:code/<repo>' for a repo main
+        added after the parent was made, leaving the branches made and no handoff."""
+        self.cudl("new", "p", "-r", "alpha")
+        self.cudl("add", "gamma", str(self.upstream("gamma", "main")))
+        c = self.w / "wt/c"
+        out = self.cudl("new", "c", "--from", "p")
+        self.assertIn("gamma", out.stderr)  # says it comes in later
+        self.assertTrue((c / "handoff/c.md").exists())
+        self.assertTrue(self.clean(c))
+        self.assertNotIn("code/gamma", self.git(c, "ls-tree", "--name-only", "HEAD", "code/"))
+        self.cudl("sync", "-f", "p")
+        self.assertIn("gamma: checked out", self.cudl("sync", "-f", "c").stdout)
+        self.assertEqual(self.head(c / "code/gamma"), self.pin(self.w, "code/gamma"))
+        # asked for by name, it's refused before anything is made (it would be an embedded repo, with no
+        # .gitmodules entry); --all leaves it out
+        self.cudl("new", "q", "-r", "alpha")
+        self.cudl("add", "delta", str(self.upstream("delta", "main")))
+        p = self.cudl("new", "c2", "--from", "q", "-r", "alpha,delta", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("delta isn't in q's lab yet", p.stderr)
+        self.assertFalse((self.w / "wt/c2").exists())
+        self.assertFalse(self.git(self.w, "branch", "--list", "feat/c2"))
+        self.assertFalse(self.git(self.w / "code/alpha", "branch", "--list", "c2"))
+        self.cudl("new", "c3", "--from", "q", "--all")
+        self.assertFalse((self.w / "wt/c3/code/delta").exists())
+        self.assertEqual(self.branch(self.w / "wt/c3/code/alpha"), "c3")
+
+    # --- the pin of a repo a feature doesn't own follows what it merges (a lab's feedback: finishes
+    # put main's older pin back) ---
+
+    def stale_pin(self, f):
+        """f's branch holds main's older pin of beta, as an older cudl's commit after a lab conflict in its
+        sync left it; returns (old, new)."""
+        old = self.pin(f, "code/beta")
+        new = self.work(self.w, "beta", "b1", "1\n", "main moves beta")
+        self.cudl("sync", cwd=f)
+        self.git(f / "code/beta", "checkout", "-q", "--detach", old)
+        self.git(f, "add", "code/beta")
+        self.git(f, "commit", "-q", "-m", "an older cudl's merge")
+        return old, new
+
+    def conflict(self, f, name="x"):
+        """The same lab file changed in f and in main: the next lab merge stops."""
+        (f / f"notes/{name}.md").write_text("feature\n")
+        self.cudl("commit", "-m", f"the feature's {name}", cwd=f)
+        (self.w / f"notes/{name}.md").write_text("main\n")
+        self.cudl("commit", "-m", f"main's {name}")
+
+    def test_a_lab_conflict_in_sync_leaves_mains_pin(self):
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        self.conflict(f1)
+        new = self.work(self.w, "beta", "b1", "1\n", "main moves beta")
+        p = self.cudl("sync", cwd=f1, check=False)
+        self.assertIn("lab merge conflicts in: notes/x.md", p.stderr)
+        self.assertEqual(self.head(f1 / "code/beta"), new)  # the checkout follows the merge before it stops
+        (f1 / "notes/x.md").write_text("both\n")
+        self.cudl("commit", "-m", "main merged", cwd=f1)
+        self.assertEqual(self.pin(f1, "code/beta"), new)
+        self.cudl("finish", "f1")
+        self.assertEqual(self.pin(self.w, "code/beta"), new)
+
+    def test_commit_after_a_merge_by_hand_leaves_mains_pin(self):
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        old = self.pin(f1, "code/beta")
+        new = self.work(self.w, "beta", "b1", "1\n", "main moves beta")
+        self.git(f1, "merge", "-q", "--no-edit", "main")  # plain git leaves code/beta's checkout behind
+        self.assertEqual(self.head(f1 / "code/beta"), old)
+        (f1 / "notes/y.md").write_text("y\n")
+        out = self.cudl("commit", "-m", "y", cwd=f1).stdout
+        self.assertIn("beta: pinned at", out)
+        self.assertEqual(self.pin(f1, "code/beta"), new)
+        self.assertEqual(self.head(f1 / "code/beta"), new)
+
+    def test_commit_of_a_stopped_merge_by_hand_leaves_mains_pin(self):
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        self.conflict(f1)
+        new = self.work(self.w, "beta", "b1", "1\n", "main moves beta")
+        self.assertNotEqual(self.sh("git", "merge", "-q", "--no-edit", "main", cwd=f1, check=False).returncode, 0)
+        (f1 / "notes/x.md").write_text("both\n")
+        p = self.cudl("commit", "--lab", "notes/x.md", "-m", "merged", cwd=f1, check=False)  # a partial commit
+        self.assertIn("in the middle of a merge", p.stderr)
+        self.assertNotEqual(self.head(f1 / "code/beta"), new)  # refused before it changed anything
+        self.cudl("commit", "-m", "main merged", cwd=f1)
+        self.assertEqual(self.pin(f1, "code/beta"), new)
+        self.assertEqual(self.head(f1 / "code/beta"), new)
+
+    def test_commit_moves_a_left_behind_checkout_with_an_untracked_file(self):
+        """The code review: a checkout with a build output in it was skipped, and its old pin recorded."""
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        new = self.work(self.w, "beta", "b1", "1\n", "main moves beta")
+        self.git(f1, "merge", "-q", "--no-edit", "main")
+        (f1 / "code/beta/build.out").write_text("x\n")
+        (f1 / "notes/y.md").write_text("y\n")
+        self.cudl("commit", "-m", "y", cwd=f1)
+        self.assertEqual(self.pin(f1, "code/beta"), new)
+        self.assertEqual(self.head(f1 / "code/beta"), new)
+        self.assertTrue((f1 / "code/beta/build.out").exists())
+
+    def test_commit_says_why_it_leaves_a_checkout_with_changes_behind(self):
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        old = self.pin(f1, "code/beta")
+        self.work(self.w, "beta", "b1", "1\n", "main moves beta")
+        self.git(f1, "merge", "-q", "--no-edit", "main")
+        (f1 / "code/beta/README").write_text("edited\n")  # a tracked file: a checkout would carry or refuse it
+        (f1 / "notes/y.md").write_text("y\n")
+        out = self.cudl("commit", "-m", "y", cwd=f1).stdout
+        self.assertIn(f"beta: left at {old[:10]}", out)
+        self.assertEqual(self.head(f1 / "code/beta"), old)
+
+    def test_commit_keeps_a_new_commit_on_a_pinned_checkout_over_a_stale_pin(self):
+        """The code review: it said it was taking main's pin, then recorded the new commit (rightly)."""
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        self.stale_pin(f1)
+        self.work(self.w, "beta", "b2", "2\n", "main moves beta again")
+        u = f1 / "code/beta"
+        (u / "u").write_text("u\n")
+        self.git(u, "add", "u")
+        self.git(u, "commit", "-q", "-m", "U")
+        self.assertNotEqual(self.sh("git", "merge", "-q", "--no-edit", "main", cwd=f1, check=False).returncode, 0)
+        out = self.cudl("commit", "-m", "merged", cwd=f1).stdout
+        self.assertNotIn("taking", out)
+        self.assertEqual(self.pin(f1, "code/beta"), self.head(u))
+
+    def test_commit_refuses_a_merge_with_unresolved_files(self):
+        """The code review: `cudl commit` concludes a stopped sync, and committed the conflict markers."""
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        self.conflict(f1)
+        self.cudl("sync", cwd=f1, check=False)
+        p = self.cudl("commit", "-m", "merged", cwd=f1, check=False)
+        self.assertIn("unresolved conflicts", p.stderr)
+        self.assertIn("notes/x.md", p.stderr)
+        self.assertTrue(self.sh("git", "rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=f1, check=False).stdout)
+
+    def test_commit_concludes_a_merge_that_changes_nothing(self):
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        self.conflict(f1)
+        self.assertNotEqual(self.sh("git", "merge", "-q", "--no-edit", "main", cwd=f1, check=False).returncode, 0)
+        self.git(f1, "checkout", "--ours", "notes/x.md")
+        self.cudl("commit", "-m", "kept ours", cwd=f1)
+        self.assertFalse(self.sh("git", "rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=f1, check=False).stdout)
+        self.assertEqual(self.git(f1, "log", "-1", "--format=%s"), "kept ours")
+
+    def test_sync_puts_back_a_pin_main_had_before(self):
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        _, new = self.stale_pin(f1)
+        self.assertIn("an older pin of main's", self.cudl("sync", cwd=f1).stdout)  # nothing to merge
+        self.assertEqual(self.pin(f1, "code/beta"), new)
+        self.assertEqual(self.head(f1 / "code/beta"), new)
+
+    def test_finish_wont_put_back_a_pin_main_had_before(self):
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        _, new = self.stale_pin(f1)
+        p = self.cudl("finish", "f1", check=False)
+        self.assertIn("beta: finishing f1 would put back", p.stderr)
+        self.assertIn("cudl sync -f f1", p.stderr)
+        self.assertEqual(self.pin(self.w, "code/beta"), new)
+
+    def test_finish_of_a_feature_behind_mains_pin(self):
+        self.cudl("new", "f1", "-r", "alpha")
+        new = self.work(self.w, "beta", "b1", "1\n", "main moves beta")  # f1 still pins the older one
+        self.cudl("finish", "f1")
+        self.assertEqual(self.pin(self.w, "code/beta"), new)
+
+    def test_a_gitmodules_conflict_in_sync_leaves_mains_pin(self):
+        """The code review: the repos were read again from the conflicted .gitmodules, which yields none."""
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        for top, value in ((f1, "true"), (self.w, "false")):
+            self.git(top, "config", "-f", ".gitmodules", "submodule.beta.fetchRecurseSubmodules", value)
+            self.git(top, "commit", "-q", "-m", "beta's fetch setting", ".gitmodules")
+        new = self.work(self.w, "beta", "b1", "1\n", "main moves beta")
+        p = self.cudl("sync", cwd=f1, check=False)
+        self.assertIn(".gitmodules", p.stderr)
+        self.assertEqual(self.head(f1 / "code/beta"), new)
+
+    def test_finish_checks_the_pins_of_a_merge_it_resolves_itself(self):
+        """The code review: merge-tree reports the INDEX.md conflict that finish resolves, and the check
+        was skipped. (Its merge=ours driver normally prevents the conflict.)"""
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        _, new = self.stale_pin(f1)
+        self.git(self.w, "config", "--unset", "merge.ours.driver")
+        for top, text in ((f1, "f1\n"), (self.w, "main\n")):
+            (top / "journal/INDEX.md").write_text(text)
+            self.git(top, "commit", "-q", "-m", "an index", "journal/INDEX.md")
+        p = self.cudl("finish", "f1", check=False)
+        self.assertIn("beta: finishing f1 would put back", p.stderr)
+        self.assertEqual(self.pin(self.w, "code/beta"), new)
+
+    def test_a_gitlink_conflict_takes_mains_pin_over_an_older_one(self):
+        self.cudl("new", "f1", "-r", "alpha")
+        f1 = self.w / "wt/f1"
+        self.stale_pin(f1)
+        self.conflict(f1)  # so the sync stops right after the merge
+        newer = self.work(self.w, "beta", "b2", "2\n", "main moves beta again")
+        self.cudl("sync", cwd=f1, check=False)  # both sides changed the gitlink
+        self.assertEqual(self.git(f1, "ls-files", "-s", "code/beta").split()[1:3], [newer, "0"])
+        self.assertEqual(self.head(f1 / "code/beta"), newer)
+
 
 if __name__ == "__main__":
     unittest.main()

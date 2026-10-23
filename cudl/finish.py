@@ -13,8 +13,8 @@ from pathlib import Path
 
 from cudl.core import (
     CudlError, GIT, busy, changed_paths, common_dir, conflicted, git, git_ok, has_staged,
-    head_branch, head_sha, is_ancestor, is_checkout, lab_lock, mib, pinned_head, porcelain, run,
-    short, split_path, tree,
+    head_branch, head_sha, is_ancestor, is_checkout, lab_lock, mib, pinned, pinned_head, porcelain, run,
+    short, split_path, stale_pin, tree,
 )
 from cudl.lab import Lab, base_of, base_problem, keep_pins, keep_since, pins_in
 from cudl.journal import (
@@ -355,6 +355,14 @@ def plan_finish(main, feat, no_ff, keep):
     problems = clean_problems(fw, skip=ended_leftovers(fw)) + wrong_branches(fw, feat) + \
         ([] if keep else sessions_in_the_way(main, feat))
     owned = [r for r in fw.repos().values() if head_branch(ftop / r.path) == feat]
+    # an older pin of main's that the lab merge would put back (an older cudl's sync could leave one)
+    merge = run(GIT + ["merge-tree", "--write-tree", "--no-messages", "HEAD", f"refs/heads/feat/{feat}"],
+                main.main, check=False)
+    for r in fw.repos().values() if merge.returncode in (0, 1) else ():  # 1: conflicts, the rest merged
+        pin = pinned(main.main, r.path, merge.stdout.split()[0])
+        if r not in owned and pin and stale_pin(main.main, "HEAD", r.path, pin):
+            problems.append(f"{r.name}: finishing {feat} would put back {short(pin)}, an older pin of main's "
+                            f"(main has {short(pinned(main.main, r.path))}): `cudl sync -f {feat}` takes main's again")
     why_not = {r.name: base_problem(main.main / r.path, r, base_of(main.main / r.path, feat, r)) for r in owned}
     problems += [f"{r.name}'s base: {why_not[r.name]}; then git -C {main.main / r.path} config "
                  f"branch.{feat}.cudlbase <branch>" for r in owned if why_not[r.name]]
