@@ -501,6 +501,41 @@ building changed most of the details below.
     at all (`worktree add` ran `post-checkout`); the boundary search has no cap; `squash` measured a child of a parent finished into `release` against the default
     branch.
 
+**Lab commits made again** (two labs' feedback, 2026-10-17 and 10-22). Lab commits that went
+unsigned (a stale agent) were re-signed: main's own by `rebase --force-rebase -S`, then each feature
+onto the re-signed main, a parent before its child. Same trees, authors and messages, new hashes.
+`sync --rebase` dealt with rewritten parents only in the code repos; the lab branch was merged, from
+a merge base before the parent's work, so both copies "added" the same files (add/add conflicts, in
+23 files once), and even a clean merge kept the old commits, for a finish to bring into main beside
+the new ones.
+- A commit of what the lab follows (the live parent's branch, else main's) whose tree, author (with
+  its date and zone) and message equal those of exactly one commit the feature holds is that commit
+  **made again**. The committer is left out: a rebase changes it.
+- `sync` puts the feature's own lab commits on the new copies by writing them again with
+  `commit-tree`: same tree, message, author and committer, parents mapped, signed when commits are;
+  merges stay merges, where a rebase would replay them and drop their resolutions. Only the commits
+  above the old copies are written again: a copy has its old commit's tree, so what's under it, and
+  whatever the rewrite did there (a reworded commit), goes with it, and no file changes. Checked
+  before anything is written, and again on the tip it rewrites (sync commits logs and pins first):
+  the lab worktree is on the feature's branch; the result keeps nothing of what's under an old copy
+  (a commit the feature started from or merged that the rewrite changed, or replayed with a new tree
+  when a plain rebase flattened a merge: refused, with a hand rebase, since the result would still
+  hold old commits); every header can be carried over; commits on a remote-tracking branch, or the
+  feature's own remote branch at an old copy, need `--force`. The branch moves by `update-ref <new>
+  <old>`, so a commit made meanwhile stops it, and a signing failure leaves it as it was. What it
+  follows is resolved once, and that commit is what's merged: a parent made again meanwhile waits for
+  the next sync. The key is read past the user's log settings (`--no-show-signature`, no mailmap,
+  UTF-8), and commits are written as UTF-8. Plain `sync` does it, without `--rebase`: no file
+  changes, and the rewrite it follows is already made, under the feature's own lab branch.
+- `finish` refuses a feature that holds old copies of main's commits (`cudl sync` first), and `finish
+  --stack` runs sync's checks on every level before it starts. `take` looks for the parent's pin from
+  the old copies too (the merge base goes back to before the parent's work), and a child whose
+  parent's finish commit was made again finds it by its new copy.
+- The code review (Codex, Fable): the check on the result first looked only for old copies, which
+  missed a plain rebase's flattened merge (the reported way to re-sign); a concurrent parent sync
+  could slip a newer tip in before the merge; `log.showSignature` turned the matching off; `take`
+  after a finish with one parent failed. Each has a test.
+
 ## Live checks inside a lab
 
 When cudl moved into a lab of its own, the move's rehearsal ran the live checks the earlier
@@ -1047,6 +1082,12 @@ Open:
   has counts as the feature's own and is recorded. A repo the feature owned once and has back on a
   detached checkout is treated like one it never owned (switch back to its branch). In the main lab,
   a lab merge by hand followed by `cudl commit` still records the integration checkouts as they are.
+- Lab commits made again ("Rewritten parents and finishing stacks"): a commit the rewrite dropped or
+  changed after its last copy stays with the feature as its own, as a merge would keep it; so does a
+  merge a plain rebase flattened when the feature started right on it (with what it merged), while
+  one under a copy is refused (`--rebase-merges`, or a script, keeps merges and their copies); a key
+  two commits share matches nothing; a feature that already merged the new copies holds both,
+  unnoticed; the old lab tip is kept only in the reflog (every tree is the same, so no pin is lost).
 - The known limits in "Sessions: what cudl promises" and "Worktree exits, notices and the memory
   index".
 

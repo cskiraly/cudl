@@ -302,8 +302,9 @@ def main(argv=None):
     p = command("sync", here_too=True, help="in a feature, merge the integration branches and main's lab in (the parent's, if stacked)")
     p.add_argument("--reparent", action="store_true", help="the parent was abandoned: follow the integration branches instead")
     p.add_argument("--rebase", action="store_true", help="the parent was rewritten (squash, amend, rebase): move this "
-                   "feature's own commits onto it")
-    p.add_argument("--force", action="store_true", help="with --rebase: even commits that are on a remote-tracking branch")
+                   "feature's own commits onto it (lab commits made again, re-signed, are followed without it)")
+    p.add_argument("--force", action="store_true", help="even commits that are on a remote-tracking branch (with "
+                   "--rebase, or lab commits made again)")
     p.set_defaults(fn=cmd_sync)
 
     p = command("finish", help="merge a feature back and remove its worktrees")

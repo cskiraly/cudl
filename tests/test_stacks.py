@@ -708,6 +708,319 @@ class TestStacks(CudlTest):
         self.assertEqual(self.git(alpha, "rev-parse", "dev"), dev)
         self.assertTrue((self.w / "wt/a").is_dir())
 
+    # --- lab commits made again (re-signed) ---
+
+    def remake(self, top, onto, *extra):
+        """Make top's lab commits since onto again, as a re-signing does: same trees, authors and
+        messages, a new committer date, so new hashes (merges made again too)."""
+        self.sh("git", "rebase", "-q", "--force-rebase", "--rebase-merges", *extra, onto, cwd=top,
+                env={"GIT_COMMITTER_DATE": "2030-01-01T00:00:00+0000"})
+
+    REWORD_A = 'test "$(git log -1 --format=%s)" != "p a" || git commit -q --amend -m "p a, reworded"'
+
+    def parent_with_notes(self, *names):
+        """Feature p (alpha) with a code commit and then one lab commit per name ("p <name>")."""
+        self.cudl("new", "p", "-r", "alpha")
+        pt = self.w / "wt/p"
+        self.work(pt, "alpha", "p1", "1\n", "p one")
+        for n in names:
+            (pt / f"notes/{n}.md").write_text(f"{n}\n")
+            self.cudl("commit", "-m", f"p {n}", cwd=pt)
+        return pt
+
+    def test_sync_after_the_parent_lab_was_remade(self):
+        """The parent's lab commits re-signed under the child (the labs' feedback, 10-17 and 10-22):
+        sync puts the child's own lab commits on the new copies, its merge kept with its tree,
+        instead of a merge that keeps the old ones."""
+        self.stack("p", "c")
+        pt, ct = self.w / "wt/p", self.w / "wt/c"
+        (pt / "notes/p.md").write_text("p\n")
+        self.cudl("commit", "-m", "p note", cwd=pt)
+        self.cudl("sync", cwd=ct)  # a lab merge of feat/p in the child
+        merge = self.git(self.w, "rev-list", "--merges", "-n1", "feat/c")
+        self.assertEqual(self.git(self.w, "rev-parse", f"{merge}^2"), self.git(self.w, "rev-parse", "feat/p"))
+        tree = self.git(self.w, "rev-parse", f"{merge}^{{tree}}")
+        (ct / "notes/c.md").write_text("c\n")
+        self.cudl("commit", "-m", "c note", cwd=ct)
+        old = set(self.git(self.w, "rev-list", "feat/p", "--not", "main").split())
+        self.remake(pt, "main")
+        self.assertFalse(old & set(self.git(self.w, "rev-list", "feat/p").split()))
+        self.assertIn("made again", self.cudl("sync", cwd=ct).stdout)
+        self.assertFalse(old & set(self.git(self.w, "rev-list", "feat/c").split()))
+        self.sh("git", "merge-base", "--is-ancestor", "feat/p", "feat/c")
+        merges = self.git(self.w, "rev-list", "--merges", "feat/p..feat/c").split()
+        self.assertEqual(len(merges), 1)
+        self.assertEqual(self.git(self.w, "rev-parse", f"{merges[0]}^2"), self.git(self.w, "rev-parse", "feat/p"))
+        self.assertEqual(self.git(self.w, "rev-parse", f"{merges[0]}^{{tree}}"), tree)
+        own = self.git(self.w, "log", "--format=%s", "feat/p..feat/c").splitlines()
+        self.assertIn("c note", own)
+        self.assertNotIn("p note", own)
+        self.assertEqual((ct / "notes/p.md").read_text(), "p\n")
+        self.assertTrue(self.clean(ct))
+        self.cudl("finish", "--stack", "c")
+        self.assertEqual(self.git(self.w, "log", "--format=%s", "main").splitlines().count("p note"), 1)
+
+    def test_sync_rebase_after_mains_lab_was_remade(self):
+        """main's lab commits re-signed under an unstacked feature: the reported `sync --rebase` swaps
+        them for the new copies, and the feature's commits that it makes again are signed when
+        commits are."""
+        base = self.git(self.w, "rev-parse", "main")
+        (self.w / "notes/m.md").write_text("m\n")
+        self.cudl("commit", "-m", "main note")
+        self.cudl("new", "f", "-r", "alpha")
+        ft = self.w / "wt/f"
+        self.work(ft, "alpha", "f1", "1\n", "f one")
+        old = set(self.git(self.w, "rev-list", "main", "--not", base).split())
+        self.remake(self.w, base)
+        self.assertIn("made again", self.cudl("sync", "--rebase", cwd=ft, env=self.fake_signer()).stdout)
+        self.assertFalse(old & set(self.git(self.w, "rev-list", "feat/f").split()))
+        self.sh("git", "merge-base", "--is-ancestor", "main", "feat/f")
+        own = self.git(self.w, "rev-list", "main..feat/f").split()
+        self.assertTrue(own)
+        for c in own:
+            self.assertIn("gpgsig", self.git(self.w, "cat-file", "-p", c))
+        self.assertTrue(self.clean(ft))
+
+    def test_sync_after_the_parent_lab_was_remade_and_reworded(self):
+        """A parent re-signed with one of its commits reworded under a re-made one: what's under the
+        re-made commit goes with it, so the child is on the new copies all the same."""
+        pt = self.parent_with_notes("a", "b")
+        ct = self.w / "wt/c"
+        self.cudl("new", "c", "--from", "p")
+        self.work(ct, "alpha", "c1", "1\n", "c one")
+        old = set(self.git(self.w, "rev-list", "feat/p", "--not", "main").split())
+        self.remake(pt, "main", "-x", self.REWORD_A)
+        self.cudl("sync", cwd=ct)
+        self.assertFalse(old & set(self.git(self.w, "rev-list", "feat/c").split()))
+        self.sh("git", "merge-base", "--is-ancestor", "feat/p", "feat/c")
+        self.assertIn("p a, reworded", self.git(self.w, "log", "--format=%s", "feat/c").splitlines())
+        self.assertTrue(self.clean(ct))
+
+    def test_sync_refuses_old_copies_a_reworded_commit_keeps(self):
+        """The child started on a parent commit that the re-signing reworded, and merged a later one:
+        its start still reaches old copies through the reworded commit, so nothing changes."""
+        pt = self.parent_with_notes("a")
+        ct = self.w / "wt/c"
+        self.cudl("new", "c", "--from", "p")  # on "p a"
+        self.work(ct, "alpha", "c1", "1\n", "c one")
+        (pt / "notes/b.md").write_text("b\n")
+        self.cudl("commit", "-m", "p b", cwd=pt)
+        self.cudl("sync", cwd=ct)
+        self.remake(pt, "main", "-x", self.REWORD_A)
+        tip = self.git(self.w, "rev-parse", "feat/c")
+        p = self.cudl("sync", cwd=ct, check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("(p a)", p.stderr)
+        self.assertEqual(self.git(self.w, "rev-parse", "feat/c"), tip)
+        self.assertTrue(self.clean(ct))
+
+    def test_finish_refuses_a_feature_holding_old_copies_of_mains_lab(self):
+        """A finish would give main both copies of its re-signed commits: refused until a sync."""
+        base = self.git(self.w, "rev-parse", "main")
+        (self.w / "notes/m.md").write_text("m\n")
+        self.cudl("commit", "-m", "main note")
+        self.cudl("new", "f", "-r", "alpha")
+        ft = self.w / "wt/f"
+        self.work(ft, "alpha", "f1", "1\n", "f one")
+        self.remake(self.w, base)
+        p = self.cudl("finish", "f", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("cudl sync -f f", p.stderr)
+        self.assertTrue(ft.is_dir())
+        self.cudl("sync", cwd=ft)
+        self.cudl("finish", "f")
+        self.assertEqual(self.git(self.w, "log", "--format=%s", "main").splitlines().count("main note"), 1)
+
+    def test_sync_refuses_to_remake_a_published_lab_branch(self):
+        """A child's lab branch on a remote: making its commits again needs --force, which says what
+        still has the old ones."""
+        self.stack("p", "c")
+        pt, ct = self.w / "wt/p", self.w / "wt/c"
+        bare = self.root / "lab-backup.git"
+        self.sh("git", "init", "-q", "--bare", str(bare))
+        self.git(self.w, "remote", "add", "backup", str(bare))
+        self.git(self.w, "push", "-q", "backup", "feat/c")
+        self.remake(pt, "main")
+        tip = self.git(self.w, "rev-parse", "feat/c")
+        p = self.cudl("sync", cwd=ct, check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("backup/feat/c", p.stderr)
+        self.assertIn("--force", p.stderr)
+        self.assertEqual(self.git(self.w, "rev-parse", "feat/c"), tip)
+        self.assertIn("backup/feat/c", self.cudl("sync", "--force", cwd=ct).stdout)
+        self.sh("git", "merge-base", "--is-ancestor", "feat/p", "feat/c")
+
+    def test_take_after_the_parents_lab_was_remade(self):
+        """take before the sync that would swap the copies: the boundary is still the parent's pin
+        (Codex's plan review: the lab merge base went back to before the parent's work)."""
+        self.cudl("new", "p", "-r", "alpha")
+        pt, ct = self.w / "wt/p", self.w / "wt/c"
+        self.work(pt, "alpha", "p1", "1\n", "p one")
+        p2 = self.work(pt, "alpha", "p2", "2\n", "p two")
+        self.cudl("new", "c", "--from", "p", "-r", "beta")  # alpha pinned at p2
+        self.remake(pt, "main")
+        self.cudl("take", "alpha", cwd=ct)
+        self.assertEqual(self.git(ct / "code/alpha", "config", "branch.c.cudlparenttip"), p2)
+
+    def test_sync_after_main_remade_a_parents_finish(self):
+        """main re-signed after the parent's finish: the finish recorded on the child is found by its
+        new copy, so the child follows main (Codex's plan review)."""
+        self.stack("p", "c")
+        ct = self.w / "wt/c"
+        before = self.git(self.w, "rev-parse", "main")
+        old = set(self.git(self.w, "rev-list", "feat/p", "--not", "main").split())
+        self.cudl("finish", "p")
+        done = self.git(self.w, "config", "branch.feat/c.cudlparentdone").split()[1]
+        self.remake(self.w, before)
+        self.assertNotIn(done, self.git(self.w, "rev-list", "main").split())
+        self.assertIn("p is finished", self.cudl("sync", cwd=ct).stdout)
+        self.assertFalse(old & set(self.git(self.w, "rev-list", "feat/c").split()))
+        self.sh("git", "merge-base", "--is-ancestor", "main", "feat/c")
+
+    def test_a_signing_failure_halfway_leaves_the_lab_branch(self):
+        """A signer that fails on its second signature: the lab branch doesn't move, and a rerun with
+        a working one goes through."""
+        self.stack("p", "c")
+        pt, ct = self.w / "wt/p", self.w / "wt/c"
+        self.remake(pt, "main")
+        tip = self.git(self.w, "rev-parse", "feat/c")
+        env = self.fake_signer()
+        counter, once = self.root / "signed", self.root / "sign-once"
+        once.write_text(f"#!/bin/sh\nn=$(cat '{counter}' 2>/dev/null || echo 0)\necho $((n + 1)) > '{counter}'\n"
+                        f"[ \"$n\" -ge 1 ] && {{ echo 'no agent' >&2; exit 1; }}\nexec '{self.root / 'signer'}' \"$@\"\n")
+        once.chmod(0o755)
+        key = next(k for k, v in env.items() if v == "gpg.ssh.program")
+        env[key.replace("KEY", "VALUE")] = str(once)
+        p = self.cudl("sync", cwd=ct, env=env, check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(counter.read_text().strip(), "2")
+        self.assertEqual(self.git(self.w, "rev-parse", "feat/c"), tip)
+        self.assertTrue(self.clean(ct))
+        self.assertIn("made again", self.cudl("sync", cwd=ct, env=self.fake_signer()).stdout)
+        self.sh("git", "merge-base", "--is-ancestor", "feat/p", "feat/c")
+
+    # --- lab commits made again: the code review (Codex) ---
+
+    def test_sync_merges_the_parent_it_checked(self):
+        """The parent's lab is made again while the child's sync runs (between its checks and its lab
+        merge): the child merges what it checked, and its next sync swaps the copies (Codex's code
+        review: a merge of the parent's newer tip left the child holding both)."""
+        self.stack("p", "c")
+        pt, ct = self.w / "wt/p", self.w / "wt/c"
+        self.work(pt, "alpha", "p2", "2\n", "p two")  # so the child's sync merges code
+        old = set(self.git(self.w, "rev-list", "feat/p", "--not", "main").split())
+        hooks = Path(self.git(ct / "code/alpha", "rev-parse", "--path-format=absolute", "--git-common-dir")) / "hooks"
+        hooks.mkdir(exist_ok=True)
+        flag = self.root / "remade-once"
+        (hooks / "post-merge").write_text(
+            f"#!/bin/sh\n[ -e '{flag}' ] && exit 0\ntouch '{flag}'\n"
+            f"env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE GIT_COMMITTER_DATE=2030-01-01T00:00:00+0000 "
+            f"git -C '{pt}' rebase -q --force-rebase --rebase-merges main\n")
+        (hooks / "post-merge").chmod(0o755)
+        self.cudl("sync", cwd=ct)
+        self.assertTrue(flag.exists())
+        self.assertFalse(old & set(self.git(self.w, "rev-list", "feat/p").split()))
+        self.assertIn("made again", self.cudl("sync", cwd=ct).stdout)
+        self.assertFalse(old & set(self.git(self.w, "rev-list", "feat/c").split()))
+
+    def test_sync_finds_copies_with_signatures_shown(self):
+        """log.showSignature on: the copies are still found (Codex's code review)."""
+        self.stack("p", "c")
+        pt, ct = self.w / "wt/p", self.w / "wt/c"
+        self.git(self.w, "config", "log.showSignature", "true")
+        old = set(self.git(self.w, "rev-list", "feat/p", "--not", "main").split())
+        signer = self.fake_signer()
+        self.sh("git", "rebase", "-q", "--force-rebase", "--rebase-merges", "-S", "main", cwd=pt,
+                env=dict(signer, GIT_COMMITTER_DATE="2030-01-01T00:00:00+0000"))
+        self.assertIn("made again", self.cudl("sync", cwd=ct, env=signer).stdout)
+        self.assertFalse(old & set(self.git(self.w, "rev-list", "feat/c").split()))
+
+    def test_take_after_a_finish_without_a_lab_merge(self):
+        """The parent's lab merged by hand before its finish: the finish commit has one parent, and
+        take still works (Codex's code review: a search from `<finish>^2` failed)."""
+        self.cudl("new", "p", "-r", "alpha")
+        pt, ct = self.w / "wt/p", self.w / "wt/c"
+        p1 = self.work(pt, "alpha", "p1", "1\n", "p one")
+        self.cudl("new", "c", "--from", "p", "-r", "beta")
+        self.git(self.w, "merge", "-q", "--no-edit", "feat/p")
+        self.cudl("finish", "p")
+        done = self.git(self.w, "config", "branch.feat/c.cudlparentdone").split()[1]
+        self.assertEqual(len(self.git(self.w, "rev-list", "--parents", "-n1", done).split()), 2)
+        self.cudl("take", "alpha", cwd=ct)
+        self.assertEqual(self.branch(ct / "code/alpha"), "c")
+        self.assertEqual(self.head(ct / "code/alpha"), p1)
+
+    def test_finish_stack_checks_the_lab_copies_first(self):
+        """A stack whose child can't go onto its parent's new copies stops before the parent is
+        finished (Codex's code review)."""
+        pt = self.parent_with_notes("a")
+        ct = self.w / "wt/c"
+        self.cudl("new", "c", "--from", "p")
+        self.work(ct, "alpha", "c1", "1\n", "c one")
+        (pt / "notes/b.md").write_text("b\n")
+        self.cudl("commit", "-m", "p b", cwd=pt)
+        self.cudl("sync", cwd=ct)
+        self.remake(pt, "main", "-x", self.REWORD_A)
+        main = self.git(self.w, "rev-parse", "main")
+        p = self.cudl("finish", "--stack", "c", check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("nothing finished", p.stderr)
+        self.assertIn("(p a)", p.stderr)
+        self.assertTrue(pt.is_dir())
+        self.assertEqual(self.git(self.w, "rev-parse", "main"), main)
+
+    def test_sync_refuses_to_move_a_published_lab_branch_off_an_old_copy(self):
+        """The child's lab branch on a remote at a commit of the parent that was made again: moving it
+        onto the new copies needs --force too (Codex's code review)."""
+        self.stack("p", "c")
+        pt, ct = self.w / "wt/p", self.w / "wt/c"
+        bare = self.root / "lab-backup.git"
+        self.sh("git", "init", "-q", "--bare", str(bare))
+        self.git(self.w, "remote", "add", "backup", str(bare))
+        self.git(self.w, "push", "-q", "backup", "feat/p:refs/heads/feat/c")  # the child's remote branch, at p's tip
+        self.remake(pt, "main")
+        tip = self.git(self.w, "rev-parse", "feat/c")
+        p = self.cudl("sync", cwd=ct, check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("backup/feat/c", p.stderr)
+        self.assertEqual(self.git(self.w, "rev-parse", "feat/c"), tip)
+
+    def test_remade_commits_keep_utf8_messages(self):
+        """A commit encoding set for the sync doesn't relabel the UTF-8 messages it makes again
+        (Codex's code review)."""
+        self.stack("p", "c")
+        pt, ct = self.w / "wt/p", self.w / "wt/c"
+        (ct / "notes/c.md").write_text("c\n")
+        self.cudl("commit", "-m", "c note é", cwd=ct)
+        self.remake(pt, "main")
+        self.cudl("sync", cwd=ct, env={"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "i18n.commitEncoding",
+                                       "GIT_CONFIG_VALUE_0": "ISO-8859-1"})
+        c = self.git(self.w, "log", "-1", "--format=%H", "--grep", "c note", "feat/c")
+        self.assertNotIn("encoding", self.git(self.w, "cat-file", "-p", c).split("\n\n")[0])
+        self.assertEqual(self.git(self.w, "log", "-1", "--format=%s", c), "c note é")
+
+    def test_sync_refuses_old_commits_a_flattened_merge_keeps(self):
+        """The parent re-signed by a plain rebase, which flattens its merge of main: its commits from
+        before that merge get new trees, so the child's start still sits on old ones that no copy
+        replaces: refused, nothing changed (Fable's code review)."""
+        pt = self.parent_with_notes("a")
+        ct = self.w / "wt/c"
+        self.cudl("new", "c", "--from", "p")  # on "p a"
+        self.work(ct, "alpha", "c1", "1\n", "c one")
+        (self.w / "notes/m.md").write_text("m\n")
+        self.cudl("commit", "-m", "main note")
+        self.cudl("sync", cwd=pt)  # p merges main
+        (pt / "notes/b.md").write_text("b\n")
+        self.cudl("commit", "-m", "p b", cwd=pt)
+        self.cudl("sync", cwd=ct)
+        self.sh("git", "rebase", "-q", "--force-rebase", "main", cwd=pt,
+                env={"GIT_COMMITTER_DATE": "2030-01-01T00:00:00+0000"})
+        tip = self.git(self.w, "rev-parse", "feat/c")
+        p = self.cudl("sync", cwd=ct, check=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("(p a)", p.stderr)
+        self.assertEqual(self.git(self.w, "rev-parse", "feat/c"), tip)
+        self.assertTrue(self.clean(ct))
 
 if __name__ == "__main__":
     unittest.main()

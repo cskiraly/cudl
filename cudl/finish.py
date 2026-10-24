@@ -23,7 +23,8 @@ from cudl.journal import (
 )
 from cudl.stack import (
     adopt_legacy, feature_finished, feature_live, lab_cfg, lab_children, lab_parent,
-    mark_parent_done, parent_end, parent_state, rewrite_advice, stacked_repos,
+    mark_parent_done, parent_end, parent_state, remade_commits, remake_plan, remake_published, rewrite_advice,
+    stacked_repos,
 )
 from cudl.sessions import (
     SESSION_ID_RE, add_notice, close_log, current_session, drop_idle_session, find_transcript,
@@ -363,6 +364,9 @@ def plan_finish(main, feat, no_ff, keep):
         if r not in owned and pin and stale_pin(main.main, "HEAD", r.path, pin):
             problems.append(f"{r.name}: finishing {feat} would put back {short(pin)}, an older pin of main's "
                             f"(main has {short(pinned(main.main, r.path))}): `cudl sync -f {feat}` takes main's again")
+    if remade_commits(main.main, f"refs/heads/feat/{feat}", "HEAD"):
+        problems.append(f"feat/{feat} holds lab commits of main's from before they were made again (re-signed?): "
+                        f"`cudl sync -f {feat}` puts its own on the new copies")
     why_not = {r.name: base_problem(main.main / r.path, r, base_of(main.main / r.path, feat, r)) for r in owned}
     problems += [f"{r.name}'s base: {why_not[r.name]}; then git -C {main.main / r.path} config "
                  f"branch.{feat}.cudlbase <branch>" for r in owned if why_not[r.name]]
@@ -625,6 +629,17 @@ def preflight_stack(main, chain):
             problems.append(f"{feat}: stacked on {parent}, which was abandoned: `cudl sync -f {feat} --reparent` first")
         stacked = stacked_repos(fw, feat, parent, state, done) if state and state != "abandoned" else []
         problems += [f"{feat}: {rewrite_advice(feat, parent, s)}" for s in stacked if s.state in ("rewritten", "tangled")]
+        name = f"feat/{parent}" if parent and state == "live" else (head_branch(main.main) or "main")
+        follows = git(ftop, "rev-parse", f"refs/heads/{name}")
+        twins = remade_commits(ftop, f"refs/heads/feat/{feat}", follows) if state != "abandoned" else {}
+        if twins:  # its sync will put its own lab commits on the new copies: what would stop it
+            _, walk, _, why = remake_plan(ftop, feat, follows, twins, name)
+            published = [] if why else remake_published(ftop, feat, follows, twins, walk)
+            if why:
+                problems.append(f"{feat}: {why}")
+            elif published:
+                problems.append(f"{feat}: {', '.join(published)} holds lab commits its sync would make again: "
+                                f"`cudl sync -f {feat} --force` first, if that's intended")
         for r in fw.repos().values():
             if head_branch(ftop / r.path) != feat:
                 continue

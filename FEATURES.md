@@ -32,6 +32,7 @@ it; [DESIGN.md](DESIGN.md) explains why it is built this way.
 - `cudl squash` folds a feature's commits into one; it refuses commits already on any remote.
 - `cudl new <child> --from <feature>` stacks a feature on an unfinished one: its plans, notes, handoff and code branches. `sync` follows the parent, and once the parent is finished, wherever the parent was merged. A repo main added after the parent was made comes in once the parent and then the child sync.
 - When the parent was rewritten (squashed, amended), `sync` stops and `cudl sync --rebase` moves the child's own commits onto it. It refuses published commits without `--force` and merges that a rebase would lose, and a rebase finished by hand is recognised.
+- When the lab commits a feature follows were made again with the same content (re-signed), `sync` puts the feature's own lab commits on the new copies, every file and merge as it was; `finish` refuses a feature that still holds the old ones.
 - `cudl finish --stack <top>` finishes a whole stack bottom-up, syncing each level first. It checks every level before it starts and is resumable after a stop.
 
 ## Working the way you already do

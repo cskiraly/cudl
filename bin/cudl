@@ -1003,8 +1003,13 @@ def parent_end(lab, child):
     done = lab_cfg(lab, child, "cudlparentdone")
     if done:
         kind, _, ref = done.partition(" ")
-        if kind == "finished" and is_ancestor(m, ref, head_branch(m) or "HEAD"):
+        head = head_branch(m) or "HEAD"
+        if kind == "finished" and is_ancestor(m, ref, head):
             return "completed", ref
+        if kind == "finished" and git_ok(m, "cat-file", "-e", f"{ref}^{{commit}}"):
+            new = remade_commits(m, ref, head).get(ref)  # main's commits made again since (re-signed)
+            if new:
+                return "completed", new
         return "abandoned", None  # given up, or its finish commit is no longer on main
     pid = lab_cfg(lab, child, "cudlparentid")
     same = not pid or lab_cfg(lab, parent, "cudlid") == pid
@@ -1282,6 +1287,151 @@ def rebase_stacked(s, feat, rehearsed):
 def forget_rebase(d, feat):
     for key in ("cudlrebaseonto", "cudlrebasefrom"):
         git(d, "config", "--unset", f"branch.{feat}.{key}", check=False)
+
+
+# Lab commits made again: a re-signing (`rebase --force-rebase -S`, say) gives a branch's commits new
+# hashes with the same trees, authors and messages. A feature whose lab holds the old copies of what
+# it follows goes onto the new ones by making its own commits again on them: every tree and merge
+# stays as it was, where a rebase would replay them and flatten the merges. A copy has the old
+# commit's tree, so what's under it goes with it and no file changes.
+
+def remade_keys(top, rng):
+    """(commit, key) for the commits of rng; the key is what making a commit again keeps: its tree,
+    author (with date and zone) and message, whatever the user's log settings."""
+    out = git(top, "log", "-z", "--no-show-signature", "--no-use-mailmap", "--encoding=UTF-8",
+              "--format=%H%n%T%n%an <%ae> %ad%n%B", "--date=raw", rng)
+    for rec in filter(None, out.split("\0")):
+        c, _, key = rec.partition("\n")
+        yield c, key
+
+
+def remade_commits(top, tip, follows):
+    """{old: new}: the commits tip holds and follows doesn't whose key matches exactly one commit of
+    follows that tip doesn't hold (two alike match nothing)."""
+    theirs = {}
+    for c, key in remade_keys(top, f"{tip}..{follows}"):
+        theirs[key] = None if key in theirs else c
+    return {c: theirs[key] for c, key in remade_keys(top, f"{follows}..{tip}") if theirs.get(key)}
+
+
+def remake_walk(top, tip, follows, twins):
+    """tip's own commits above the old copies, oldest first, with their parents: [(commit, parents,
+    changes)], where a commit changes when a parent does. And a commit the result would keep that
+    follows no longer has (one under an old copy that the rewrite changed or flattened away, which
+    the feature started from or merged), or None."""
+    stop = "".join(f"^{c}\n" for c in twins)
+    lines = run(GIT + ["rev-list", "--topo-order", "--reverse", "--parents", "--stdin"], top,
+                input=f"{tip}\n^{follows}\n{stop}").stdout.splitlines()
+    walk, changed = [], set(twins)
+    for line in lines:
+        c, *ps = line.split()
+        if any(p in changed for p in ps):
+            changed.add(c)
+        walk.append((c, ps, c in changed))
+    mine = {c for c, _, _ in walk}
+    for p in sorted({p for _, ps, _ in walk for p in ps if p not in mine and p not in twins}):
+        if git(top, "rev-list", "-n1", p, f"^{follows}"):  # left out of the walk only because an old copy reaches it
+            return walk, p
+    return walk, None
+
+
+REMAKE_HEADERS = {"tree", "parent", "author", "committer", "gpgsig", "gpgsig-sha256"}
+
+
+def commit_objects(top, shas):
+    """{sha: (header lines, message bytes)} of these commits: what commit-tree needs to make them again."""
+    out = subprocess.run(GIT + ["cat-file", "--batch"], cwd=top, input="".join(f"{s}\n" for s in shas).encode(),
+                         capture_output=True, check=True).stdout
+    objs, i = {}, 0
+    for s in shas:
+        j = out.index(b"\n", i)
+        size = int(out[i:j].split()[2])
+        head, _, msg = out[j + 1:j + 1 + size].partition(b"\n\n")
+        objs[s] = ([l for l in head.decode().split("\n") if l and not l.startswith(" ")], msg)
+        i = j + 2 + size
+    return objs
+
+
+def remake_plan(top, feat, follows, twins, name):
+    """How feat's lab goes onto the new copies of follows' commits (`name` in messages): its tip, the
+    walk, the objects to write again, and why it can't (or None)."""
+    tip = git(top, "rev-parse", f"refs/heads/feat/{feat}")
+    walk, keeps = remake_walk(top, tip, follows, twins)
+    objs = commit_objects(top, [c for c, _, changes in walk if changes])
+    how = (f"move {feat}'s own lab commits onto {name} by hand (git -C {top} rebase --onto {name} "
+           f"<the last commit it took from {name}> feat/{feat}), then cudl sync")
+    why = None
+    if head_branch(top) != f"feat/{feat}":
+        why = (f"the lab worktree is on {head_branch(top) or 'a detached HEAD'}, not feat/{feat}: switch back "
+               f"(git -C {top} switch feat/{feat}) first")
+    elif keeps:
+        why = (f"{name}'s lab commits were made again (re-signed?), and some changed: feat/{feat} would still "
+               f"hold old ones through {short(keeps)} ({git(top, 'log', '-1', '--format=%s', keeps)}): {how}")
+    for c, (head, _) in objs.items() if not why else ():
+        bad = {l.split(" ", 1)[0] for l in head} - REMAKE_HEADERS
+        if bad:
+            why = (f"{name}'s lab commits were made again (re-signed?), but {short(c)} of feat/{feat} has what "
+                   f"making it again can't carry over ({', '.join(sorted(bad))}): {how}")
+            break
+    return tip, walk, objs, why
+
+
+def remake_published(top, feat, follows, twins, walk):
+    """Remote-tracking branches holding what making feat's lab commits again replaces: one of the
+    lowest it writes again (a branch that holds any holds one of them), or, for feat's own remote
+    branches, an old copy."""
+    todo = {c for c, _, changes in walk if changes}
+    lowest = [c for c, ps, changes in walk if changes and not any(p in todo for p in ps)]
+    refs = {r for c in lowest for r in git(top, "for-each-ref", "--format=%(refname:lstrip=2)", "--contains", c,
+                                           "refs/remotes").split()}
+    for ref in child_remote_refs(top, f"feat/{feat}"):
+        if twins.keys() & set(git(top, "rev-list", ref, f"^{follows}").split()):
+            refs.add(ref.removeprefix("refs/remotes/"))
+    return sorted(refs)
+
+
+def person(v):
+    """(name, email, 'seconds zone') of an author or committer header."""
+    lt, gt = v.index("<"), v.rindex(">")
+    return v[:lt].strip(), v[lt + 1:gt], v[gt + 1:].strip()
+
+
+def remake_lab(top, feat, follows, twins, name):
+    """Make feat's own lab commits above the old copies again on the new ones, from its tip as it is
+    now (checked again: sync committed logs and pins since its checks): same tree, message, author and
+    committer, signed when commits are; a merge stays one unless its parents map to one commit. Moves
+    feat/<feat> only if it hasn't moved meanwhile. Returns the old tip and how many were made again."""
+    old, _, objs, why = remake_plan(top, feat, follows, twins, name)
+    if why:
+        raise CudlError(f"lab: {why} (feat/{feat} is as it was)")
+    sign = ["-S"] if git(top, "config", "--type=bool", "commit.gpgsign", check=False) == "true" else []
+    made = dict(twins)
+    for c, (head, msg) in objs.items():
+        fields = [l.split(" ", 1) for l in head]
+        parents = list(dict.fromkeys(made.get(v, v) for k, v in fields if k == "parent"))
+        env = dict(os.environ)
+        for who in ("author", "committer"):
+            n, email, date = person(next(v for k, v in fields if k == who))
+            env.update({f"GIT_{who.upper()}_NAME": n, f"GIT_{who.upper()}_EMAIL": email,
+                        f"GIT_{who.upper()}_DATE": date})
+        tree = next(v for k, v in fields if k == "tree")
+        cmd = GIT + ["-c", "i18n.commitEncoding=UTF-8", "commit-tree", *sign, tree,
+                     *(x for q in parents for x in ("-p", q))]
+        p = subprocess.run(cmd, cwd=top, input=msg, capture_output=True, env=env)
+        if p.returncode != 0:
+            why = p.stderr.decode(errors="replace").strip()
+            raise CudlError(f"lab: making {short(c)} again failed, so feat/{feat} is as it was:\n{why}"
+                            + (f"\n{signing_diagnosis(top)}" if sign else ""))
+        made[c] = p.stdout.decode().strip()
+    new = made.get(old, old)
+    if git(top, "rev-parse", f"{new}^{{tree}}") != git(top, "rev-parse", f"{old}^{{tree}}"):
+        raise CudlError(f"lab: making feat/{feat}'s commits again changed its files (a bug): nothing moved")
+    p = run(GIT + ["update-ref", "-m", f"cudl sync: onto {name}'s lab commits made again", f"refs/heads/feat/{feat}",
+                   new, old], top, check=False)
+    if p.returncode != 0:
+        raise CudlError(f"lab: feat/{feat} moved while its commits were made again (a commit in another "
+                        f"session?), so it is as it was: run cudl sync again")
+    return old, len(objs)
 
 
 # --- cudl/sessions.py -----------------------------------------------------------------------------
@@ -2249,14 +2399,16 @@ def parent_pin(w, feat, r, state, done, head):
     over a newer parent pin)."""
     parent = lab_parent(w, feat)
     ref = f"refs/heads/feat/{parent}" if state == "live" else f"{done}^2" if done else None
-    if not ref:
-        return None
+    if not ref or not git_ok(w.main, "rev-parse", "-q", "--verify", f"{ref}^{{commit}}"):
+        return None  # a finish whose lab was merged before it has no second parent
     point = run(GIT + ["merge-base", f"refs/heads/feat/{feat}", ref], w.main, check=False).stdout.strip()
-    if not point:
+    # and the old copies of parent commits it has made again since (a re-signing), which the merge base misses
+    starts = [point] * bool(point) + list(remade_commits(w.main, f"refs/heads/feat/{feat}", ref))
+    if not starts:
         return None
     d = w.top / r.path
     seen = set()
-    for c in git(w.main, "log", "--format=%H", point, "--", r.path, check=False).split() + [point]:
+    for c in git(w.main, "log", "--format=%H", *starts, "--", r.path, check=False).split() + starts:
         pin = run(GIT + ["rev-parse", "-q", "--verify", f"{c}:{r.path}"], w.main, check=False).stdout.strip()
         if pin and pin not in seen:
             seen.add(pin)
@@ -2623,6 +2775,20 @@ def sync_feature(w, rebase=False, force=False, reparent_abandoned=False, link=Tr
     if problems:
         raise CudlError("nothing rebased:\n  " + "\n  ".join(problems))
     rehearsed = {s.repo.name: rebase_verdict(s, feat) for s in todo}  # every verdict before any write
+    main_branch = f"feat/{parent}" if parent and state == "live" else (head_branch(w.main) or "main")
+    # resolved once: what's checked is what's merged (a parent made again meanwhile waits for the next sync)
+    follows = git(w.top, "rev-parse", f"refs/heads/{main_branch}")
+    twins = remade_commits(w.top, f"refs/heads/feat/{feat}", follows)  # what it follows was re-signed
+    published = []
+    if twins:
+        _, walk, _, why = remake_plan(w.top, feat, follows, twins, main_branch)
+        if why:
+            raise CudlError(f"nothing synced: {why}")
+        published = remake_published(w.top, feat, follows, twins, walk)
+        if published and not force:
+            raise CudlError(f"nothing synced: {main_branch}'s lab commits were made again (re-signed?), so "
+                            f"feat/{feat}'s own go onto the new copies, but {', '.join(published)} holds what "
+                            f"that replaces: it rewrites what others may have; --force if that's intended")
     targets = {}  # what to merge, resolved once: a branch moving meanwhile doesn't change what's recorded
     for r in repos.values():
         d = w.top / r.path
@@ -2686,6 +2852,9 @@ def sync_feature(w, rebase=False, force=False, reparent_abandoned=False, link=Tr
     if todo and kids:
         print(f"note: {', '.join(kids)} {'is' if len(kids) == 1 else 'are'} stacked on {feat}, which was just "
               f"rebased: `cudl sync -f <child> --rebase` there")
+    elif twins and kids:
+        print(f"note: {', '.join(kids)} {'is' if len(kids) == 1 else 'are'} stacked on {feat}, whose lab commits "
+              f"are made again: `cudl sync -f <child>` there puts {'its' if len(kids) == 1 else 'their'} own on them")
     for r in repos.values():
         if r.name not in targets:
             continue
@@ -2699,11 +2868,17 @@ def sync_feature(w, rebase=False, force=False, reparent_abandoned=False, link=Tr
             print(f"{r.name}: merged {base}")
         if parent and base == parent:
             git(d, "config", f"branch.{feat}.cudlparenttip", sha)
-    main_branch = f"feat/{parent}" if parent else (head_branch(w.main) or "main")
     with lab_lock(w):
-        merging = not is_ancestor(w.top, main_branch, "HEAD")
-        p = run(GIT + ["merge", "--no-edit", main_branch], w.top, check=False) if merging else None
-        follow_pins(w, repos, main_branch)  # before the merge is committed or stops: whatever commits it records these pins
+        if twins:  # the tip now, with the logs and pins committed above: they're its own too
+            was, n = remake_lab(w.top, feat, follows, twins, main_branch)
+            print(f"lab: {len(twins)} commits of {main_branch} were made again (re-signed?) since {feat} took them "
+                  f"in: its own {n} are now on the new copies (old tip {short(was)}, no file changed)")
+            for ref in published:
+                print(f"  {ref} has the old commits")
+        merging = not is_ancestor(w.top, follows, "HEAD")
+        p = run(GIT + ["merge", "--no-edit", "-m", f"Merge branch '{main_branch}' into feat/{feat}", follows], w.top,
+                check=False) if merging else None
+        follow_pins(w, repos, follows, main_branch)  # before the merge is committed or stops: whatever commits it records these pins
         if merging:
             if p.returncode != 0:
                 remaining = resolve_generated(w.top, conflicted(w.top), repos)
@@ -3129,6 +3304,9 @@ def plan_finish(main, feat, no_ff, keep):
         if r not in owned and pin and stale_pin(main.main, "HEAD", r.path, pin):
             problems.append(f"{r.name}: finishing {feat} would put back {short(pin)}, an older pin of main's "
                             f"(main has {short(pinned(main.main, r.path))}): `cudl sync -f {feat}` takes main's again")
+    if remade_commits(main.main, f"refs/heads/feat/{feat}", "HEAD"):
+        problems.append(f"feat/{feat} holds lab commits of main's from before they were made again (re-signed?): "
+                        f"`cudl sync -f {feat}` puts its own on the new copies")
     why_not = {r.name: base_problem(main.main / r.path, r, base_of(main.main / r.path, feat, r)) for r in owned}
     problems += [f"{r.name}'s base: {why_not[r.name]}; then git -C {main.main / r.path} config "
                  f"branch.{feat}.cudlbase <branch>" for r in owned if why_not[r.name]]
@@ -3391,6 +3569,17 @@ def preflight_stack(main, chain):
             problems.append(f"{feat}: stacked on {parent}, which was abandoned: `cudl sync -f {feat} --reparent` first")
         stacked = stacked_repos(fw, feat, parent, state, done) if state and state != "abandoned" else []
         problems += [f"{feat}: {rewrite_advice(feat, parent, s)}" for s in stacked if s.state in ("rewritten", "tangled")]
+        name = f"feat/{parent}" if parent and state == "live" else (head_branch(main.main) or "main")
+        follows = git(ftop, "rev-parse", f"refs/heads/{name}")
+        twins = remade_commits(ftop, f"refs/heads/feat/{feat}", follows) if state != "abandoned" else {}
+        if twins:  # its sync will put its own lab commits on the new copies: what would stop it
+            _, walk, _, why = remake_plan(ftop, feat, follows, twins, name)
+            published = [] if why else remake_published(ftop, feat, follows, twins, walk)
+            if why:
+                problems.append(f"{feat}: {why}")
+            elif published:
+                problems.append(f"{feat}: {', '.join(published)} holds lab commits its sync would make again: "
+                                f"`cudl sync -f {feat} --force` first, if that's intended")
         for r in fw.repos().values():
             if head_branch(ftop / r.path) != feat:
                 continue
@@ -4583,8 +4772,9 @@ def main(argv=None):
     p = command("sync", here_too=True, help="in a feature, merge the integration branches and main's lab in (the parent's, if stacked)")
     p.add_argument("--reparent", action="store_true", help="the parent was abandoned: follow the integration branches instead")
     p.add_argument("--rebase", action="store_true", help="the parent was rewritten (squash, amend, rebase): move this "
-                   "feature's own commits onto it")
-    p.add_argument("--force", action="store_true", help="with --rebase: even commits that are on a remote-tracking branch")
+                   "feature's own commits onto it (lab commits made again, re-signed, are followed without it)")
+    p.add_argument("--force", action="store_true", help="even commits that are on a remote-tracking branch (with "
+                   "--rebase, or lab commits made again)")
     p.set_defaults(fn=cmd_sync)
 
     p = command("finish", help="merge a feature back and remove its worktrees")
