@@ -598,5 +598,70 @@ class TestFeatures(CudlTest):
         self.assertEqual(self.head(f1 / "code/beta"), newer)
 
 
+    # --- the labs' feedback, October ---
+
+    def test_commit_leaves_out_what_isnt_a_repo_under_code(self):
+        """An untracked entry under a feature's code/ (a build link, say) stays out of the lab's commit;
+        sync and finish go past it, and the finish keeps it (a lab's feedback, filed twice)."""
+        self.cudl("new", "f1", "-r", "alpha")
+        f = self.w / "wt/f1"
+        (f / "code/link").symlink_to(f / "code/alpha")
+        (f / "code/hidden").symlink_to(f / "code/alpha")  # and one the user had git ignore
+        info = Path(self.git(f, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "info"
+        info.mkdir(exist_ok=True)
+        (info / "exclude").write_text("/code/hidden\n")
+        (f / "notes/n.md").write_text("n\n")
+        out = self.cudl("commit", "-m", "notes", cwd=f).stdout
+        self.assertIn("left out code/link", out)
+        self.assertNotIn("code/link", self.git(f, "ls-tree", "-r", "--name-only", "HEAD"))
+        self.assertIn("notes/n.md", self.git(f, "ls-tree", "-r", "--name-only", "HEAD"))
+        self.cudl("sync", cwd=f)
+        self.cudl("finish", "f1")
+        self.assertFalse(f.exists())
+        for name in ("link", "hidden"):
+            kept = list((self.w / "scratch").glob(f"f1-*/code/{name}"))
+            self.assertEqual(len(kept), 1)
+            self.assertTrue(kept[0].is_symlink())
+
+    def test_new_checks_signing_before_it_makes_anything(self):
+        """Signing that fails (a dead agent socket) stops `new` before anything is made; it used to leave
+        the worktree and both branches, so a rerun failed on them (three reports from the labs)."""
+        p = self.cudl("new", "f1", "-r", "alpha", check=False, env=self.fake_signer(works=False))
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("nothing was made", p.stderr)
+        self.assertFalse((self.w / "wt/f1").exists())
+        self.assertEqual(self.git(self.w, "branch", "--list", "feat/f1"), "")
+        self.assertEqual(self.git(self.w / "code/alpha", "branch", "--list", "f1"), "")
+        self.cudl("new", "f1", "-r", "alpha", env=self.fake_signer())
+
+    def test_new_doesn_t_wait_for_a_signer_that_never_answers(self):
+        """An SSH agent whose connection went away can take the request and never answer: the probe
+        gives up, nothing made, and leaves no signer behind (found as this was built)."""
+        pidfile = self.root / "signer.pid"
+        hung = self.root / "hung-signer"
+        hung.write_text(f"#!/bin/sh\necho $$ > '{pidfile}'\nexec sleep 600\n")
+        hung.chmod(0o755)
+        env = dict(self.fake_signer(), GIT_CONFIG_VALUE_2=str(hung), CUDL_SIGNING_PROBE_TIMEOUT="2")
+        self.assertEqual(env["GIT_CONFIG_KEY_2"], "gpg.ssh.program")
+        p = self.cudl("new", "f1", "-r", "alpha", check=False, env=env)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("doesn't answer", p.stderr)
+        self.assertFalse((self.w / "wt/f1").exists())
+        self.assertFalse(Path(f"/proc/{pidfile.read_text().strip()}").exists())
+
+
+    def test_a_stray_clone_under_code_doesn_t_stop_a_sync_or_finish(self):
+        """A clone under code/ shows as `code/x/`, with a slash: it didn't match the stray, and a sync and a
+        finish asked to commit it (Codex's code review)."""
+        self.cudl("new", "f1", "-r", "alpha")
+        f = self.w / "wt/f1"
+        clone = f / "code/a clone"
+        self.git(self.root, "clone", "-q", str(self.up_b), str(clone))
+        self.cudl("commit", "-m", "nothing", cwd=f, check=False)
+        self.cudl("sync", cwd=f)
+        self.cudl("finish", "f1")
+        self.assertTrue(any((self.w / "scratch").glob("f1-*/code/a clone/.git")))
+
+
 if __name__ == "__main__":
     unittest.main()

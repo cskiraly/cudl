@@ -39,6 +39,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -131,15 +132,28 @@ def signing_on(cwd):
     return run(GIT + ["config", "--type=bool", "--get", "commit.gpgsign"], cwd, check=False).stdout.strip() == "true"
 
 
+# an SSH agent whose connection went away can take a signature request and never answer
+SIGNING_PROBE_TIMEOUT = 30
+
+
 def check_signing(cwd, what):
     """With commit signing on, make sure the signer works before a command that writes in several steps
     and can't stop halfway gracefully: a probe commit of the empty tree (a dangling object)."""
     if not signing_on(cwd):
         return
     empty = run(GIT + ["hash-object", "-t", "tree", "/dev/null"], cwd).stdout.strip()
-    p = run(GIT + ["commit-tree", "-S", empty, "-m", "cudl: signing probe"], cwd, check=False)
+    wait = int(os.environ.get("CUDL_SIGNING_PROBE_TIMEOUT") or SIGNING_PROBE_TIMEOUT)
+    p = subprocess.Popen(GIT + ["commit-tree", "-S", empty, "-m", "cudl: signing probe"], cwd=cwd, text=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, process_group=0)  # with the terminal
+    try:
+        _, err = p.communicate(timeout=wait)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)  # the signer too, git's child, which would hang on
+        p.communicate()
+        raise CudlError(f"commit signing doesn't answer (nothing in {wait} s: an SSH agent that went away?), "
+                        f"so {what}") from None
     if p.returncode != 0:
-        raise CudlError(f"commit signing doesn't work, so {what}:\n{p.stderr.strip()}\n{signing_diagnosis(cwd)}")
+        raise CudlError(f"commit signing doesn't work, so {what}:\n{err.strip()}\n{signing_diagnosis(cwd)}")
 
 
 def git(cwd, *args, check=True):
@@ -186,6 +200,12 @@ def porcelain(d, untracked=True):
 def lab_changes(top):
     """Lab changes, counting a submodule only when its HEAD moved, not when it is dirty."""
     return git(top, "status", "--porcelain", "-uall", "--ignore-submodules=dirty").splitlines()
+
+
+def code_strays(top):
+    """What's untracked under code/, which holds only the code repos: a build link, a stray clone. Not
+    the lab's to commit, nor in the way of a sync or a finish (one that removes the worktree keeps it)."""
+    return [p.rstrip("/") for x, _, p in status_entries(top, "code") if x == "?"]
 
 
 def status_entries(top, *paths, literal=True, submodules="dirty"):
@@ -675,13 +695,16 @@ def commit_with_index(top, take, states, msg, extra=()):
     return commit_selected(top, take, states, msg, extra)
 
 
-def commit_session_dirs(lab, top, dirs, msg, untracked=True):
-    """Commit what changed under these directories of a worktree, and nothing else, unless an operation
-    is in progress there; with journal/ among them, the index lists exactly the logs committed."""
+def commit_session_dirs(lab, top, dirs, msg, untracked=True, leave=None):
+    """Commit what changed under these directories of a worktree, and nothing else (nor the paths that
+    `leave(paths)` returns, asked under the lock), unless an operation is in progress there; with
+    journal/ among them, the index lists exactly the logs committed."""
     with lab_lock(lab):
         if busy(top):
             return False
         take, split, states = select_paths(top, dirs, untracked)
+        out = leave(take) if leave else ()
+        take = [p for p in take if p not in out]
         old = pinned_head(top)
         if (commit_with_index if "journal" in dirs else commit_selected)(top, take, states, msg):
             keep_since(Lab(top), old)
@@ -690,41 +713,45 @@ def commit_session_dirs(lab, top, dirs, msg, untracked=True):
 
 
 
-def ended_logs(fw):
-    """This worktree's uncommitted logs of sessions that have ended: the commit their ends couldn't make
-    (it failed, on signing say). Only what a commit can take as it is: sync and finish commit these."""
+def leftover_logs(fw):
+    """This worktree's uncommitted session logs that a commit can take as they are, which sync and finish
+    commit: those of sessions that have ended (the commit their ends couldn't make: it failed, on signing
+    say), and the linked logs of sessions working here from elsewhere with `-f` (their ends close them
+    wherever they are, after a finish in main). Not the log of a session started here, which may be
+    writing it (`running_since:`)."""
     logs = []
     for path in changed_paths(fw.top, "journal/sessions"):
         fm = readable_frontmatter(fw.top / path) if path.endswith(".md") and (fw.top / path).is_file() else {}
-        if fm.get("ended") and not fm.get("running_since"):
+        linked = fm.get("role") == "continued" and fm.get("feature") == fw.label
+        if (fm.get("ended") or linked) and not fm.get("running_since"):
             logs.append(path)
     return select_paths(fw.top, logs)[0] if logs else []
 
 
-def ended_leftovers(fw):
-    """What the checks before sync and finish leave out, because commit_ended_logs commits it: the ended
-    sessions' logs, and the session index when there are any (an end's commit writes it first)."""
-    logs = ended_logs(fw)
+def log_leftovers(fw):
+    """What the checks before sync and finish leave out, because commit_leftover_logs commits it: those
+    logs, and the session index when there are any (an end's commit writes it first)."""
+    logs = leftover_logs(fw)
     return logs + [INDEX] if logs else []
 
 
-def commit_ended_logs(fw, before):
-    """Commit ended_logs, as the sessions' ends would have. The checks before it left them out, so if the
+def commit_leftover_logs(fw, before):
+    """Commit leftover_logs, as the sessions' ends would have. The checks before it left them out, so if the
     commit fails, nothing may go on: the logs would go with the worktree."""
     with lab_lock(fw):
-        take = ended_logs(fw)
+        take = leftover_logs(fw)
         if not take:
             return
         states = select_paths(fw.top, take)[2]
         try:
-            done = commit_with_index(fw.top, take, states, f"journal: logs of ended sessions that their ends "
-                                                           f"couldn't commit, before {before}")
+            done = commit_with_index(fw.top, take, states, f"journal: session logs as they are (sessions that "
+                                                           f"ended, or work here from elsewhere), before {before}")
         except CudlError as e:  # with the signing diagnosis, when signing was the cause
-            raise CudlError(f"the logs of ended sessions couldn't be committed ({', '.join(take)}):\n{e}") from None
+            raise CudlError(f"the session logs couldn't be committed ({', '.join(take)}):\n{e}") from None
         if not done:  # nothing a commit would record after all
             return
-    print(f"committed {', '.join(Path(p).name for p in take)}: " + ("its session ended without committing it"
-          if len(take) == 1 else "their sessions ended without committing them"))
+    print(f"committed {', '.join(Path(p).name for p in take)} as {'it is' if len(take) == 1 else 'they are'}: "
+          f"logs of sessions that ended, or work here from elsewhere")
 
 FM_KEYS = ["session", "date", "feature", "agent", "role", "parent", "outer", "from", "features", "last_feature", "started", "running_since", "ended", "goal", "outcome", "next", "tags",
            "compactions", "needs_summary", "source", "branch", "transcript", "lab", "repos", "touched"]
@@ -915,13 +942,6 @@ def last_session(top, label):
     if fm.get("next"):
         s += f" → {fm['next']}"
     return s
-
-
-def commit_memory(w, msg=None):
-    """From a feature, commit the shared memory directory on main (not while main is busy)."""
-    if not (w.main / "memory").is_dir():
-        return False
-    return bool(commit_session_dirs(w, w.main, ["memory"], msg or f"memory: from {w.label}"))
 
 
 # --- cudl/stack.py --------------------------------------------------------------------------------
@@ -1818,6 +1838,22 @@ def hook_lab(data):
     return Lab.find(hook_target(data))
 
 
+def lab_path(w, rel):
+    """A path of this worktree's lab, as a session's context gives it: from the lab's top in main, and
+    absolute in a feature, where the user would read a lab-relative path as main's (main has files of
+    the same names)."""
+    return str(w.top / rel) if w.feature else str(rel)
+
+
+def go_note(w):
+    """Go finds a repository only by a .git directory (checked with Go 1.25); a code checkout's .git is a
+    file (a submodule's, a worktree's), so its builds stamp the enclosing lab's commit."""
+    gomods = [lab_path(w, r.path) for r in w.repos().values() if (w.top / r.path / "go.mod").is_file()]
+    return (f"Go builds in {', '.join(gomods)} stamp the lab's commit as vcs.revision, not the code's (Go "
+            f"finds a repository only by a .git directory, and a code checkout's .git is a file): build with "
+            f"-buildvcs=false, and pass the code's commit by -ldflags where the program takes one.") if gomods else ""
+
+
 def subagent_context(w, sf, parent):
     return "\n".join([
         f"cudl: this session was started by session {parent} in the cudl {w.top}"
@@ -1825,7 +1861,7 @@ def subagent_context(w, sf, parent):
         "Do the task you were given and report back. Don't commit, don't run /wrap, and don't edit",
         "handoff/, journal/ or memory/ unless the task says so: the session that started you owns them.",
         "Code is in code/<repo>; notes and plans in the lab; AGENTS.md has the rules.",
-        f"This run is logged in {sf.relative_to(w.top)} under its parent.",
+        f"This run is logged in {lab_path(w, sf.relative_to(w.top))} under its parent.",
     ])
 
 
@@ -1844,7 +1880,8 @@ def session_context(w, sf, source, agent="claude", home=None):
     where = (f"feature `{w.feature}` ({w.top}, lab branch feat/{w.feature}"
              + (f", stacked on {parent}" + (f", which is {pstate}" if pstate != "live" else "") if parent else "")
              + ")") if w.feature else f"the main lab ({w.top})"
-    lines = [f"cudl: this session is in {where}. Session log: {sf.relative_to(w.top)}."]
+    log = lab_path(w, sf.relative_to(w.top))
+    lines = [f"cudl: this session is in {where}. Session log: {log}."]
     for r in w.repos().values():
         lines.append("  " + repo_line(w.top, r))
     lines.append(f"Shared memory: {w.main / 'memory'}. Plans: {w.top / 'plans'}.")
@@ -1862,23 +1899,24 @@ def session_context(w, sf, source, agent="claude", home=None):
                 text = text[:MEMORY_INDEX_LIMIT] + "\n[… truncated; read the file for the rest]"
             lines += ["", "## Memory index (memory/MEMORY.md; see AGENTS.md › Memory)", text.strip()]
     if source == "compact":
-        lines.append(f"(The context was just compacted; the session log is {sf.relative_to(w.top)}.)")
+        lines.append(f"(The context was just compacted; the session log is {log}.)")
     # the handoff of where the work is now: the most recent feature, for a session that moved
     if last and last != w.label and w.feature_top(last).is_dir():
         text = handoff_text(w.feature_top(last), last)
         if text:
-            lines += ["", f"## Handoff of {last}, where this session last worked (wt/{last}/handoff/{last}.md)",
-                      text.strip()]
-        lines.append(f"(This worktree's own handoff: handoff/{w.label}.md.)")
+            there = w.feature_top(last) / "handoff" / f"{last}.md" if w.feature else f"wt/{last}/handoff/{last}.md"
+            lines += ["", f"## Handoff of {last}, where this session last worked ({there})", text.strip()]
+        lines.append(f"(This worktree's own handoff: {lab_path(w, f'handoff/{w.label}.md')}.)")
     else:
         text = handoff_text(w.top, w.label)
         if text:
-            lines += ["", f"## Handoff (handoff/{w.label}.md)", text.strip()]
+            lines += ["", f"## Handoff ({lab_path(w, f'handoff/{w.label}.md')})", text.strip()]
     index = w.top / "journal" / "INDEX.md"
     if index.exists():
         entries = [l for l in index.read_text().splitlines() if l.startswith("- ")]
-        if entries:
-            lines += ["", "## Recent sessions (journal/INDEX.md)"] + entries[-RECENT_SESSIONS:]
+        if entries:  # the index's links are from journal/: the context gives them as its other paths
+            lines += ["", f"## Recent sessions ({lab_path(w, 'journal/INDEX.md')})"] + \
+                [l.replace("](sessions/", f"]({lab_path(w, 'journal/sessions')}/") for l in entries[-RECENT_SESSIONS:]]
     return "\n".join(lines)
 
 
@@ -1915,10 +1953,13 @@ def hook_session_start(a):
                                    if fm0.get("role") == "continued" and session_home(w, sid)[1] else None)
     home = session_home(w, sid)[1] if fm0.get("role") == "continued" else None  # speaks for the whole session
     ctx = subagent_context(w, sf, parent) if parent else session_context(w, sf, data.get("source"), a.agent, home)
+    note = go_note(w)
+    if note:
+        ctx += "\n\n" + note
     # the context goes to the agent; one line of it is shown to the user
     where = f"feature {w.feature}" if w.feature else "main lab"
     shown = (f"cudl: subagent of {parent[:8]} in the {where}" if parent else
-             f"cudl: {where} · log {sf.relative_to(w.top)} · handoff "
+             f"cudl: {where} · log {sf.relative_to(w.main)} · handoff "
              + ("loaded" if (w.top / "handoff" / f"{w.label}.md").exists() else "missing"))
     planted = [r.path for r in w.repos().values() if is_checkout(w.top / r.path) and (  # at its top, or tracked
         any((w.top / r.path / n).exists() for n in (".cudl", MARKER))
@@ -1988,6 +2029,96 @@ def had_exchange(transcript, agent):
     except OSError:
         return True
     return False
+
+
+# The tool calls that write a file: Claude Code's file tools (the path in `file_path`, a notebook's in
+# `notebook_path`), and Codex's patches, whose text names each file (a move's new one in `Move to:`),
+# relative to the session's working directory unless absolute.
+WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+PATCH_FILE_RE = re.compile(r"\*\*\* (?:(?:Add|Update|Delete) File|Move to): ([^\n\\\"]+)")
+
+
+def files_written(transcript, under):
+    """The files directly in directory `under` that a transcript shows its session writing, by a file
+    tool or a patch (a mention elsewhere, a read, doesn't count), relative to under's parent; none if
+    the transcript can't be read."""
+    out, needle, cwd = set(), str(under).encode(), None
+    try:
+        with open(transcript, "rb") as f:
+            for line in f:
+                # what can name a file there: its path, a patch, or a Codex record of the working directory
+                if needle not in line and b"apply_patch" not in line and b'"cwd"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(r, dict):
+                    continue
+                pl = r.get("payload")
+                if isinstance(pl, dict) and r.get("type") in ("session_meta", "turn_context") and pl.get("cwd"):
+                    cwd = str(pl["cwd"])
+                if isinstance(pl, dict) and pl.get("type") in ("function_call", "custom_tool_call"):
+                    text = str(pl.get("input") or pl.get("arguments") or "")
+                    if pl.get("name") == "apply_patch" or "apply_patch" in text:
+                        out.update(os.path.join(cwd, p.rstrip()) if cwd and not p.startswith("/") else p.rstrip()
+                                   for p in PATCH_FILE_RE.findall(text))
+                msg = r.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
+                for c in content if isinstance(content, list) else []:
+                    if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("name") in WRITE_TOOLS \
+                            and isinstance(c.get("input"), dict):
+                        out.add(str(c["input"].get("file_path") or c["input"].get("notebook_path") or ""))
+    except (OSError, TypeError, UnicodeDecodeError):
+        return set()
+    under = Path(under)
+    return {str(Path(p).relative_to(under.parent)) for p in map(os.path.normpath, filter(None, out))
+            if Path(p).parent == under}
+
+
+def memory_of_others(w, sid, changed):
+    """{path: session} of these changed files of main's memory/ that another session still running wrote,
+    by its transcript, and session sid didn't: that session's own commit or end takes them. A write no
+    transcript shows (by a shell command, say) is anybody's; a subagent's, its parent's to say. With no
+    session (sid None: yours, from a shell), none: what a session that crashed wrote would wait for good."""
+    mem, theirs = w.main / "memory", {}
+    if not changed or not sid:
+        return theirs
+    running = dict.fromkeys(s for top in lab_tops(w) for s in open_sessions(Lab(top), but=(sid,)))
+
+    def written(s):
+        home = session_home(w, s)[1]
+        fm = readable_frontmatter(home) if home else {}
+        t = None if fm.get("parent") else find_transcript(s, fm.get("agent") or "claude", fm.get("transcript"))
+        return files_written(t, mem) & set(changed) if t else set()
+
+    for s in running:
+        for p in written(s):
+            theirs.setdefault(p, s)
+    mine = written(sid) if theirs and sid else set()
+    return {p: s for p, s in theirs.items() if p not in mine}
+
+
+def say_left(theirs, out=sys.stdout):
+    for p, s in sorted(theirs.items()):
+        print(f"memory: left {p} for session {s[:8]}, which wrote it and is still running (its own commit or end "
+              f"takes it; if that session is gone, yours does: `cudl commit --lab {p}`)", file=out)
+
+
+def commit_memory(w, msg=None, sid=None):
+    """From a feature, commit the shared memory directory on main (not while main is busy), but what
+    another running session wrote (memory_of_others, judged under the lock on what is committed)."""
+    if not (w.main / "memory").is_dir():
+        return False
+    sid, left = sid or current_session(w), {}
+
+    def theirs(take):
+        left.update(memory_of_others(w, sid, take))
+        return left
+
+    done = commit_session_dirs(w, w.main, ["memory"], msg or f"memory: from {w.label}", leave=theirs)
+    say_left(left)
+    return bool(done)
 
 
 def changed_since(top, entries, since):
@@ -2097,7 +2228,7 @@ def hook_session_end(a):
     if not any(lab.top == lab.main for lab, _ in logs):
         # a session that worked only in features: the shared memory it wrote is on main
         try:
-            commit_memory(w, f"memory: from session {sid[:8]} ({w.label})")
+            commit_memory(w, f"memory: from session {sid[:8]} ({w.label})", sid)
         except CudlError as e:
             print(f"cudl: main's memory/ is not committed: {e}", file=sys.stderr)
 
@@ -2174,6 +2305,9 @@ def close_log(w, sf, sid, kids=(), transcript=None):
         take, split, states = select_paths(w.top, paths)
         if split:
             print(f"cudl: left alone, staged and then changed again: {', '.join(split[:5])}", file=sys.stderr)
+        theirs = memory_of_others(w, sid, [p for p in take if p.startswith("memory/")]) if w.top == w.main else {}
+        say_left(theirs, sys.stderr)
+        take = [p for p in take if p not in theirs]
         pins = [r for r in record if r.path in take]
         dirs = sorted({p.split("/")[0] for p in take if p.split("/")[0] in ("memory", "plans")})
         msg = (f"journal: session {sid[:8]}" + (f"; pins {', '.join(r.name for r in pins)}" if pins else "")
@@ -2299,6 +2433,7 @@ def cmd_new(a, quiet=False):
             raise CudlError(f"--handoff-from {seed}: no such file, and no feature with a committed "
                             f"handoff/{seed}.md" if handoff_from else f"--from {seed}: no committed handoff/{seed}.md")
         seeded = got.stdout, f"handoff/{seed}.md"
+    check_signing(main, "nothing was made")  # its start commit comes after the worktrees and branches
 
     git(main, "worktree", "add", "-q", "-b", f"feat/{feat}", str(top), f"feat/{parent}" if parent else "HEAD")
     git(main, "config", f"branch.feat/{feat}.cudlid", os.urandom(6).hex())
@@ -2333,7 +2468,12 @@ def cmd_new(a, quiet=False):
     old = pinned_head(top)
     git(top, "add", "-A")
     if has_staged(top):
-        git(top, "commit", "-q", "-m", f"cudl: start feature {feat}" + (f" from {parent}" if parent else ""))
+        start = f"cudl: start feature {feat}" + (f" from {parent}" if parent else "")
+        try:
+            git(top, "commit", "-q", "-m", start)
+        except CudlError as e:
+            raise CudlError(f"{e}\n{feat} is made, all but its start commit: once commits work, "
+                            f"`cudl commit -f {feat} -m \"{start}\"` completes it") from None
     keep_since(fw, old)
     link_session(fw, quiet=True)
     if not quiet:
@@ -2535,7 +2675,7 @@ def cmd_commit(a):
                                        if p.startswith("journal/sessions/")])
         else:
             build_index(w.top)
-        old = pinned_head(w.top)
+        old, strays = pinned_head(w.top), []
         moved = [r.path for r in repos.values() if is_checkout(w.top / r.path) and pinned(w.top, r.path) != head_sha(w.top / r.path)
                  and git_ok(w.top, "diff", "--cached", "--quiet", "--", r.path)]  # a pin staged by hand stays as staged
         only = [*a.lab, *moved, "journal/INDEX.md"] if a.lab else None  # only these lab paths, plus the pins
@@ -2546,7 +2686,14 @@ def cmd_commit(a):
             if there:
                 git(w.top, "add", "--", *there)
         else:
-            git(w.top, "add", "-A")
+            strays = add_all(w.top)
+            # in main, what another running session wrote in the shared memory is its own to commit
+            staged = [] if w.feature or merging else git(w.top, "diff", "--cached", "--name-only", "-z", "--",
+                                                          "memory").split("\0")
+            theirs = memory_of_others(w, current_session(w), [p for p in staged if p])
+            if theirs:
+                git(w.top, "--literal-pathspecs", "reset", "-q", "--", *theirs)  # its file stays as it is
+                say_left(theirs)
         if (only and not git_ok(w.top, "diff", "--cached", "--quiet", "--", *only)) or \
                 (not only and (has_staged(w.top) or merging)):
             trailers = []
@@ -2562,6 +2709,10 @@ def cmd_commit(a):
             print(f"lab: {short(head_sha(w.top))} on {head_branch(w.top)}")
         elif not done:
             print("nothing to commit")
+    if strays:
+        names = list(dict.fromkeys("/".join(p.split("/")[:2]) for p in strays))  # an untracked directory, once
+        print(f"note: left out {', '.join(names[:3])}{' …' if len(names) > 3 else ''}: code/ holds only the "
+              f"code repos; it stays, untracked (a finish keeps it in scratch/)")
     if w.feature and not a.no_memory and commit_memory(w):
         print("memory: committed on main")
     if unstaged:
@@ -2642,6 +2793,13 @@ def resolve_generated(top, conflicts, repos, gitlinks=True):
     return remaining
 
 
+def add_all(top):
+    """Stage every lab change but what's untracked under code/ (code_strays); returns that."""
+    strays = code_strays(top)
+    git(top, "add", "-A", "--", ".", *[f":(exclude,literal){p}" for p in strays])
+    return strays
+
+
 def check_clean(fw, what, ignore=()):
     """Nothing uncommitted in a feature worktree but the lab paths in `ignore`."""
     problems = []
@@ -2649,7 +2807,8 @@ def check_clean(fw, what, ignore=()):
         d = fw.top / r.path
         if is_checkout(d) and porcelain(d):
             problems.append(f"{r.name} has uncommitted changes")
-    if [l for l in lab_changes(fw.top) if l[3:] not in ignore]:
+    ignore = {*ignore, *code_strays(fw.top)}
+    if [p for _, _, p in status_entries(fw.top) if p.rstrip("/") not in ignore]:
         problems.append("the lab has uncommitted changes (or unrecorded code commits)")
     if problems:
         raise CudlError(f"{what}: commit first (cudl commit):\n  " + "\n  ".join(problems))
@@ -2720,8 +2879,8 @@ def record_moved_pins(w, why):
 
 def clean_problems(fw, skip=()):
     """What stops a sync or finish: uncommitted work, an operation in progress. Moved pins that
-    `record_moved_pins` would record don't count, nor the paths in `skip` (ended_leftovers: the caller
-    commits those)."""
+    `record_moved_pins` would record don't count, nor what's untracked under code/ (code_strays), nor the
+    paths in `skip` (log_leftovers: the caller commits those)."""
     problems = []
     for r in fw.repos().values():
         d = fw.top / r.path
@@ -2733,15 +2892,30 @@ def clean_problems(fw, skip=()):
         elif porcelain(d):
             problems.append(f"{r.name} has uncommitted changes")
     recordable = {r.path for r in pins_to_record(fw)}
+    skip = {*skip, *code_strays(fw.top)}
     what = busy(fw.top)
     if what:
         problems.append(f"the lab has {what} in progress")
     else:
-        changed = [l[3:] for l in lab_changes(fw.top) if l[3:] not in recordable and l[3:] not in skip]
+        changed = list(dict.fromkeys(p for _, _, p in status_entries(fw.top)
+                                     if p not in recordable and p.rstrip("/") not in skip))
         if changed:
             problems.append(f"the lab has uncommitted changes: {', '.join(changed[:4])}" + (" …" if len(changed) > 4 else "")
-                            + (" (a session still running there?)" if any(c.startswith("journal/sessions/") for c in changed) else ""))
+                            + logs_hint(fw, [c for c in changed if c.startswith("journal/sessions/")]))
     return problems
+
+
+def logs_hint(fw, logs):
+    """Whose these uncommitted session logs are, and what commits them."""
+    me, says = current_session(fw), []
+    for p in logs:
+        fm = readable_frontmatter(fw.top / p) if (fw.top / p).is_file() else {}
+        s = fm.get("session")
+        if not s:
+            continue
+        says.append("this session's log: `cudl commit` it first" if s == me else
+                    f"session {s[:8]}'s log: it is running there; its `cudl commit`, or its end, commits it")
+    return f" ({'; '.join(dict.fromkeys(says))})" if says else ""
 
 
 def cmd_sync(a):
@@ -2756,7 +2930,7 @@ def sync_feature(w, rebase=False, force=False, reparent_abandoned=False, link=Tr
     child of a rewritten parent has its own commits moved onto it (see rebase_checks)."""
     feat = w.feature
     repos = w.repos()
-    problems = clean_problems(w, skip=ended_leftovers(w))
+    problems = clean_problems(w, skip=log_leftovers(w))
     if problems:
         raise CudlError("sync: commit first (cudl commit):\n  " + "\n  ".join(problems))
     parent = lab_parent(w, feat)
@@ -2810,7 +2984,7 @@ def sync_feature(w, rebase=False, force=False, reparent_abandoned=False, link=Tr
     adopt_legacy(Lab(w.main))  # freezes the judgements made above (ids for features made before them)
     if link:
         link_session(w)
-    commit_ended_logs(w, "syncing")
+    commit_leftover_logs(w, "syncing")
     record_moved_pins(w, "sync")
     old = pinned_head(w.top)
     for s in todo:
@@ -2896,7 +3070,7 @@ def sync_feature(w, rebase=False, force=False, reparent_abandoned=False, link=Tr
                     continue
                 print(f"{r.name}: checked out at {short(pin)}, pinned (`cudl take {r.name}` to work on it)")
         build_index(w.top)
-        git(w.top, "add", "-A")
+        add_all(w.top)
         if has_staged(w.top):
             git(w.top, "commit", "-q", "-m", f"cudl: sync {feat} with {main_branch}")
     keep_since(w, old)
@@ -2991,11 +3165,14 @@ def keep_ignored(main, fw, stamp=None):
     """`git worktree remove` deletes ignored files, so the lab worktree's (scratch/, journal/raw/: the
     lab's working material) first go to the main lab's scratch/<feature>-<stamp>/. Its settings.local.json,
     which `cudl setup` writes, doesn't count. Code checkouts' ignored files, their projects' build
-    output, go with them as with any worktree removal."""
+    output, go with them as with any worktree removal. What's beside them under code/, ignored or
+    untracked (code_strays: the removal would refuse it), goes to scratch/ too."""
     out = run(GIT + ["status", "--porcelain=v1", "-z", "--ignored=matching", "--ignore-submodules=all"],
               fw.top).stdout
+    repos = [r.path for r in fw.repos().values()]
     paths = [e[3:].rstrip("/") for e in out.split("\0") if e.startswith("!! ")]
-    paths = [p for p in paths if p != ".claude/settings.local.json" and p.split("/")[0] != "code"]
+    paths = [p for p in paths if p != ".claude/settings.local.json"
+             and not any(p == r or p.startswith(r + "/") for r in repos)] + code_strays(fw.top)
     if not paths:
         return None
     base = Path(main) / "scratch" / f"{fw.feature}-{stamp or datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -3006,7 +3183,7 @@ def keep_ignored(main, fw, stamp=None):
     for p in paths:
         (dest / p).parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(fw.top / p), str(dest / p))
-    print(f"kept {fw.feature}'s ignored files ({', '.join(paths[:3])}{' …' if len(paths) > 3 else ''}) "
+    print(f"kept {fw.feature}'s untracked files ({', '.join(paths[:3])}{' …' if len(paths) > 3 else ''}) "
           f"in {dest.relative_to(main)}/")
     return dest
 
@@ -3293,7 +3470,7 @@ def plan_finish(main, feat, no_ff, keep):
                             + (f"finish {parent} first, or the whole stack: cudl finish --stack {feat}" if state == "live" else
                                f"run `cudl sync` in {feat} first, so it follows the integration branches "
                                f"(or `cudl finish --stack {feat}`, which does)"))
-    problems = clean_problems(fw, skip=ended_leftovers(fw)) + wrong_branches(fw, feat) + \
+    problems = clean_problems(fw, skip=log_leftovers(fw)) + wrong_branches(fw, feat) + \
         ([] if keep else sessions_in_the_way(main, feat))
     owned = [r for r in fw.repos().values() if head_branch(ftop / r.path) == feat]
     # an older pin of main's that the lab merge would put back (an older cudl's sync could leave one)
@@ -3320,7 +3497,7 @@ def plan_finish(main, feat, no_ff, keep):
     if problems:
         raise NothingMerged("nothing merged:\n  " + "\n  ".join(problems))
     adopt_legacy(main)  # before the first write: a legacy parent retained by this finish stays live
-    commit_ended_logs(fw, f"finishing {feat}")
+    commit_leftover_logs(fw, f"finishing {feat}")
     record_moved_pins(fw, "finish")
     keep_pins(main, pins_in(main.main, [f"feat/{feat}"]))  # whatever happens next, its pins stay
     # what main_problems let through, the sessions' tracked files, in a commit of their own: a checkpoint
@@ -3561,7 +3738,7 @@ def preflight_stack(main, chain):
             problems.append(f"{feat}: no live feature at {ftop}")
             continue
         fw = Lab(ftop)
-        problems += [f"{feat}: {p}" for p in clean_problems(fw, skip=ended_leftovers(fw)) + wrong_branches(fw, feat)
+        problems += [f"{feat}: {p}" for p in clean_problems(fw, skip=log_leftovers(fw)) + wrong_branches(fw, feat)
                      + sessions_in_the_way(main, feat, notes=False)]
         parent = lab_parent(main, feat)
         state, done = parent_end(main, feat)
@@ -3901,7 +4078,7 @@ def upgrade_user_file(w, rel, take):
 
     Provenance, in order: the hash recorded when cudl last wrote the file (authoritative); else
     whether it matches any past template version (the tool repo's history); else unknown, and
-    it is kept. An edited file is replaced only with --take.
+    it is kept. An edited file is replaced only with --take. Returns whether it replaced the file.
     """
     mine, tmpl = w.top / rel, TEMPLATE / rel
     marker = read_marker(w.top)
@@ -3917,7 +4094,7 @@ def upgrade_user_file(w, rel, take):
         if current != recorded:
             print(f"note: {rel} was edited here, so it was kept.\n  the difference: diff -u {rel} {tmpl}\n"
                   f"  take the template's: cudl upgrade --take {flag}")
-            return
+            return False
         shutil.copy2(tmpl, mine)
         state = "updated from the template (unedited)"
     else:
@@ -3930,10 +4107,27 @@ def upgrade_user_file(w, rel, take):
                 "can't tell whether it was edited (no template history)"
             print(f"note: {rel} {why}; kept.\n  the difference: diff -u {rel} {tmpl}\n"
                   f"  take the template's: cudl upgrade --take {flag}")
-            return
+            return False
     marker.setdefault("templates", {})[rel] = template
     write_marker(w.top, marker)
     print(f"{rel}: {state}")
+    return state != "up to date"
+
+
+TOOL_FILES = (".cudl/cudl", ".agents/skills", ".claude/skills", ".codex/hooks.json")
+
+
+def tool_files(top):
+    """{path: content} of the files upgrade replaces (a link's content: where it points)."""
+    out = {}
+    for rel in TOOL_FILES:
+        p = top / rel
+        for f in sorted(p.rglob("*")) if p.is_dir() and not p.is_symlink() else [p]:
+            if f.is_symlink():
+                out[str(f.relative_to(top))] = os.readlink(f)
+            elif f.is_file():
+                out[str(f.relative_to(top))] = f.read_bytes()
+    return out
 
 
 def cmd_upgrade(a):
@@ -3941,6 +4135,7 @@ def cmd_upgrade(a):
     require_main(w)
     if not TEMPLATE.is_dir():
         raise CudlError("run upgrade from the cudl tool repository")
+    before = tool_files(w.top)
     install_tool(w.top)
     install_lab_hooks(w)
     backfill_keeps(w)
@@ -3949,18 +4144,29 @@ def cmd_upgrade(a):
     claude_files(w.top)
     (w.top / ".codex").mkdir(exist_ok=True)
     shutil.copy2(TEMPLATE / ".codex" / "hooks.json", w.top / ".codex" / "hooks.json")
+    after = tool_files(w.top)
+    # a skill counts once, however many of its files changed
+    skill = (".agents/skills/", ".claude/skills/")
+    changed = list(dict.fromkeys("/".join(k.split("/")[:3]) if k.startswith(skill) else k
+                                 for k in sorted(before.keys() | after.keys()) if before.get(k) != after.get(k)))
     for src in TEMPLATE.rglob("*"):
         dst = w.top / src.relative_to(TEMPLATE)
         if src.is_dir() and not src.is_symlink():
             dst.mkdir(exist_ok=True)
         elif not dst.exists() and not dst.is_symlink():
             shutil.copy2(src, dst, follow_symlinks=False)
+            changed.append(str(dst.relative_to(w.top)))  # a file the template gained
     take = set(a.take or [])
-    for flag, rel in USER_FILES.items():
-        upgrade_user_file(w, rel, flag in take)
-    print("updated .cudl/cudl, the skills and .codex/hooks.json; review with git diff, then cudl commit\n"
-          "features made earlier get the upgrade with `cudl sync` in each feature\n"
-          "codex: re-trust changed hooks in /hooks")
+    wrote = [rel for flag, rel in USER_FILES.items() if upgrade_user_file(w, rel, flag in take)]
+    if changed:
+        print(f"updated {', '.join(changed)}")
+    elif not wrote:
+        print("the tool's files were up to date")
+        return
+    print("review with git diff, then cudl commit\n"
+          "features made earlier get the upgrade with `cudl sync` in each feature")
+    if ".codex/hooks.json" in changed:
+        print("codex: re-trust the changed hooks in /hooks")
 
 
 def link(src, dst):

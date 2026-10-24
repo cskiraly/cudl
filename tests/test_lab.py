@@ -130,7 +130,8 @@ class TestLab(CudlTest):
         out = self.cudl("upgrade").stdout
         self.assertIn("AGENTS.md was edited here, so it was kept", out)
         self.assertIn("a rule of my own", (self.w / "AGENTS.md").read_text())
-        self.assertIn("replacing your edits", self.cudl("upgrade", "--take", "agents-md").stdout)
+        out = self.cudl("upgrade", "--take", "agents-md").stdout
+        self.assertIn("replacing your edits", out)
         self.assertEqual((self.w / "AGENTS.md").read_text(), template)
         self.assertIn("cudl sync", out)
         # the same for settings.json
@@ -469,6 +470,19 @@ class TestLab(CudlTest):
             self.assertNotEqual(p.returncode, 0, extra)
             self.assertIn("--link", p.stderr)
         self.assertEqual(len(list((self.w / "notes/cudl-feedback").glob("*.md"))), 1)
+
+
+    def test_upgrade_says_what_it_changed(self):
+        """upgrade said it updated .codex/hooks.json, and asked for Codex's re-trust, every time."""
+        (self.w / ".codex/hooks.json").write_text("{}")
+        out = self.cudl("upgrade").stdout
+        self.assertIn(".codex/hooks.json", out)
+        self.assertIn("re-trust", out)
+        self.cudl("commit", "-m", "upgrade")
+        out = self.cudl("upgrade").stdout
+        self.assertNotIn("re-trust", out)
+        self.assertNotIn(".codex/hooks.json", out)
+        self.assertIn("up to date", out)
 
 
 if __name__ == "__main__":

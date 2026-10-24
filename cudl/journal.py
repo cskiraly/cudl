@@ -62,13 +62,16 @@ def commit_with_index(top, take, states, msg, extra=()):
     return commit_selected(top, take, states, msg, extra)
 
 
-def commit_session_dirs(lab, top, dirs, msg, untracked=True):
-    """Commit what changed under these directories of a worktree, and nothing else, unless an operation
-    is in progress there; with journal/ among them, the index lists exactly the logs committed."""
+def commit_session_dirs(lab, top, dirs, msg, untracked=True, leave=None):
+    """Commit what changed under these directories of a worktree, and nothing else (nor the paths that
+    `leave(paths)` returns, asked under the lock), unless an operation is in progress there; with
+    journal/ among them, the index lists exactly the logs committed."""
     with lab_lock(lab):
         if busy(top):
             return False
         take, split, states = select_paths(top, dirs, untracked)
+        out = leave(take) if leave else ()
+        take = [p for p in take if p not in out]
         old = pinned_head(top)
         if (commit_with_index if "journal" in dirs else commit_selected)(top, take, states, msg):
             keep_since(Lab(top), old)
@@ -77,41 +80,45 @@ def commit_session_dirs(lab, top, dirs, msg, untracked=True):
 
 
 
-def ended_logs(fw):
-    """This worktree's uncommitted logs of sessions that have ended: the commit their ends couldn't make
-    (it failed, on signing say). Only what a commit can take as it is: sync and finish commit these."""
+def leftover_logs(fw):
+    """This worktree's uncommitted session logs that a commit can take as they are, which sync and finish
+    commit: those of sessions that have ended (the commit their ends couldn't make: it failed, on signing
+    say), and the linked logs of sessions working here from elsewhere with `-f` (their ends close them
+    wherever they are, after a finish in main). Not the log of a session started here, which may be
+    writing it (`running_since:`)."""
     logs = []
     for path in changed_paths(fw.top, "journal/sessions"):
         fm = readable_frontmatter(fw.top / path) if path.endswith(".md") and (fw.top / path).is_file() else {}
-        if fm.get("ended") and not fm.get("running_since"):
+        linked = fm.get("role") == "continued" and fm.get("feature") == fw.label
+        if (fm.get("ended") or linked) and not fm.get("running_since"):
             logs.append(path)
     return select_paths(fw.top, logs)[0] if logs else []
 
 
-def ended_leftovers(fw):
-    """What the checks before sync and finish leave out, because commit_ended_logs commits it: the ended
-    sessions' logs, and the session index when there are any (an end's commit writes it first)."""
-    logs = ended_logs(fw)
+def log_leftovers(fw):
+    """What the checks before sync and finish leave out, because commit_leftover_logs commits it: those
+    logs, and the session index when there are any (an end's commit writes it first)."""
+    logs = leftover_logs(fw)
     return logs + [INDEX] if logs else []
 
 
-def commit_ended_logs(fw, before):
-    """Commit ended_logs, as the sessions' ends would have. The checks before it left them out, so if the
+def commit_leftover_logs(fw, before):
+    """Commit leftover_logs, as the sessions' ends would have. The checks before it left them out, so if the
     commit fails, nothing may go on: the logs would go with the worktree."""
     with lab_lock(fw):
-        take = ended_logs(fw)
+        take = leftover_logs(fw)
         if not take:
             return
         states = select_paths(fw.top, take)[2]
         try:
-            done = commit_with_index(fw.top, take, states, f"journal: logs of ended sessions that their ends "
-                                                           f"couldn't commit, before {before}")
+            done = commit_with_index(fw.top, take, states, f"journal: session logs as they are (sessions that "
+                                                           f"ended, or work here from elsewhere), before {before}")
         except CudlError as e:  # with the signing diagnosis, when signing was the cause
-            raise CudlError(f"the logs of ended sessions couldn't be committed ({', '.join(take)}):\n{e}") from None
+            raise CudlError(f"the session logs couldn't be committed ({', '.join(take)}):\n{e}") from None
         if not done:  # nothing a commit would record after all
             return
-    print(f"committed {', '.join(Path(p).name for p in take)}: " + ("its session ended without committing it"
-          if len(take) == 1 else "their sessions ended without committing them"))
+    print(f"committed {', '.join(Path(p).name for p in take)} as {'it is' if len(take) == 1 else 'they are'}: "
+          f"logs of sessions that ended, or work here from elsewhere")
 
 FM_KEYS = ["session", "date", "feature", "agent", "role", "parent", "outer", "from", "features", "last_feature", "started", "running_since", "ended", "goal", "outcome", "next", "tags",
            "compactions", "needs_summary", "source", "branch", "transcript", "lab", "repos", "touched"]
@@ -303,9 +310,3 @@ def last_session(top, label):
         s += f" → {fm['next']}"
     return s
 
-
-def commit_memory(w, msg=None):
-    """From a feature, commit the shared memory directory on main (not while main is busy)."""
-    if not (w.main / "memory").is_dir():
-        return False
-    return bool(commit_session_dirs(w, w.main, ["memory"], msg or f"memory: from {w.label}"))

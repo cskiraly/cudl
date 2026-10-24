@@ -40,7 +40,9 @@ the memory, journal and handoffs.
   explicitly: `.cudl/cudl <command> -f <feature>` for cudl (`-f` after the command, the form
   that runs without asking), `git -C wt/<feature>/code/<repo> …` and absolute paths for
   everything else. Run `.cudl/cudl` from the lab's top directory: inside `code/<repo>` that path
-  would be a file of the repository's own.
+  would be a file of the repository's own. Point the user to a feature's file by its path from the
+  main lab (`wt/<feature>/notes/x.md`) or an absolute one: they read paths against the main lab,
+  which has files of the same names. Links inside lab files stay lab-relative.
 - `.cudl/cudl status` and `.cudl/cudl ls` show where things stand; `.cudl/cudl squash` folds a
   feature's commits into one. When a feature's parent was rewritten, `.cudl/cudl sync -f
   <feature> --rebase` moves the feature's own commits onto it; with `--force` (published commits)

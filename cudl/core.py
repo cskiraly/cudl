@@ -6,6 +6,7 @@ import fcntl
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from contextlib import contextmanager
@@ -90,15 +91,28 @@ def signing_on(cwd):
     return run(GIT + ["config", "--type=bool", "--get", "commit.gpgsign"], cwd, check=False).stdout.strip() == "true"
 
 
+# an SSH agent whose connection went away can take a signature request and never answer
+SIGNING_PROBE_TIMEOUT = 30
+
+
 def check_signing(cwd, what):
     """With commit signing on, make sure the signer works before a command that writes in several steps
     and can't stop halfway gracefully: a probe commit of the empty tree (a dangling object)."""
     if not signing_on(cwd):
         return
     empty = run(GIT + ["hash-object", "-t", "tree", "/dev/null"], cwd).stdout.strip()
-    p = run(GIT + ["commit-tree", "-S", empty, "-m", "cudl: signing probe"], cwd, check=False)
+    wait = int(os.environ.get("CUDL_SIGNING_PROBE_TIMEOUT") or SIGNING_PROBE_TIMEOUT)
+    p = subprocess.Popen(GIT + ["commit-tree", "-S", empty, "-m", "cudl: signing probe"], cwd=cwd, text=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, process_group=0)  # with the terminal
+    try:
+        _, err = p.communicate(timeout=wait)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)  # the signer too, git's child, which would hang on
+        p.communicate()
+        raise CudlError(f"commit signing doesn't answer (nothing in {wait} s: an SSH agent that went away?), "
+                        f"so {what}") from None
     if p.returncode != 0:
-        raise CudlError(f"commit signing doesn't work, so {what}:\n{p.stderr.strip()}\n{signing_diagnosis(cwd)}")
+        raise CudlError(f"commit signing doesn't work, so {what}:\n{err.strip()}\n{signing_diagnosis(cwd)}")
 
 
 def git(cwd, *args, check=True):
@@ -145,6 +159,12 @@ def porcelain(d, untracked=True):
 def lab_changes(top):
     """Lab changes, counting a submodule only when its HEAD moved, not when it is dirty."""
     return git(top, "status", "--porcelain", "-uall", "--ignore-submodules=dirty").splitlines()
+
+
+def code_strays(top):
+    """What's untracked under code/, which holds only the code repos: a build link, a stray clone. Not
+    the lab's to commit, nor in the way of a sync or a finish (one that removes the worktree keeps it)."""
+    return [p.rstrip("/") for x, _, p in status_entries(top, "code") if x == "?"]
 
 
 def status_entries(top, *paths, literal=True, submodules="dirty"):

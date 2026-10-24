@@ -25,7 +25,7 @@ class TestSessions(CudlTest):
         out = json.loads(self.cudl("hook", "session-start", input=inp, cwd=f).stdout)
         ctx = out["hookSpecificOutput"]["additionalContext"]
         self.assertIn("feature `f1`", ctx)
-        self.assertRegex(out["systemMessage"], r"^cudl: feature f1 · log journal/sessions/.*-f1-abcdef12\.md · handoff loaded$")
+        self.assertRegex(out["systemMessage"], r"^cudl: feature f1 · log wt/f1/journal/sessions/.*-f1-abcdef12\.md · handoff loaded$")
         self.assertIn("State: halfway.", ctx)
         logs = list((f / "journal/sessions").glob("*-f1-abcdef12.md"))
         self.assertEqual(len(logs), 1)
@@ -1035,6 +1035,149 @@ class TestSessions(CudlTest):
         (a / "nested/README").write_text("edited in the session\n")
         self.session("session-end", sid, self.w, transcript_path=str(self.root / "never-written.jsonl"))
         self.assertIn("0e0e0e25", self.git(self.w, "ls-files", "journal/sessions"))
+
+
+    # --- the labs' feedback, October ---
+
+    def wrote(self, transcript, path, agent="claude"):
+        """A record of the session writing `path`, in its transcript: Claude Code's Write tool, or a Codex
+        patch (with the path from the lab's top, as Codex writes them, relative to its working directory)."""
+        rec = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Write", "input": {"file_path": str(path), "content": "x"}}]}} \
+            if agent == "claude" else \
+            {"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch", "input":
+                                                  f"*** Begin Patch\n*** Add File: {path.relative_to(self.w)}\n+x\n*** End Patch\n"}}
+        with open(transcript, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def test_commit_leaves_the_memory_another_running_session_wrote(self):
+        """`commit -f` commits main's memory/, but not what another session still running wrote: it took
+        another session's edits under its own name (a lab's feedback). Its end commits them."""
+        a, b = "a1a1a1a1-0000-4000-8000-000000000001", "b2b2b2b2-0000-4000-8000-000000000002"
+        ta = self.exchange(a)
+        tb = self.root / ".codex/sessions/2026/10/24" / f"rollout-2026-10-24T00-00-00-{b}.jsonl"
+        tb.parent.mkdir(parents=True)
+        tb.write_text(json.dumps({"type": "session_meta", "payload": {"id": b, "cwd": str(self.w)}}) + "\n")
+        self.start(a, CLAUDE_CODE_SESSION_ID=a)
+        self.start(b, agent="codex", CODEX_THREAD_ID=b)
+        self.cudl("new", "f1", env={"CLAUDE_CODE_SESSION_ID": a})
+        for t, name, agent in ((ta, "a", "claude"), (tb, "b", "codex")):
+            m = self.w / f"memory/{name}.md"
+            m.write_text(f"---\nname: {name}\n---\n{name}\n")
+            self.wrote(t, m, agent)
+        (self.w / "memory/c.md").write_text("---\nname: c\n---\nby nobody's tools\n")
+        (self.w / "wt/f1/notes/n.md").write_text("n\n")
+        out = self.cudl("commit", "-f", "f1", "-m", "notes", env={"CLAUDE_CODE_SESSION_ID": a}).stdout
+        self.assertIn("memory/b.md", out)
+        self.assertIn(b[:8], out)
+        self.assertEqual(sorted(self.git(self.w, "show", "--name-only", "--format=", "HEAD").split()),
+                         ["memory/a.md", "memory/c.md"])
+        self.assertIn("?? memory/b.md", self.git(self.w, "status", "--porcelain"))
+        # b's end commits it
+        self.cudl("hook", "session-end", "--agent", "codex",
+                  input=json.dumps({"session_id": b, "cwd": str(self.w)}), env={"CODEX_THREAD_ID": b})
+        self.assertIn("memory/b.md", self.git(self.w, "ls-files", "memory"))
+
+    def test_your_own_commit_takes_every_session_s_memory(self):
+        """A commit without a session, yours from a shell, takes what running sessions wrote too: one that
+        crashed never ends, and its files would wait for good (Fable's code review)."""
+        b = "b9b9b9b9-0000-4000-8000-000000000009"
+        tb = self.exchange(b)
+        self.start(b, CLAUDE_CODE_SESSION_ID=b)
+        self.cudl("new", "f1")
+        m = self.w / "memory/b.md"
+        m.write_text("---\nname: b\n---\nb\n")
+        self.wrote(tb, m)
+        (self.w / "wt/f1/notes/n.md").write_text("n\n")
+        self.cudl("commit", "-f", "f1", "-m", "notes")
+        self.assertIn("memory/b.md", self.git(self.w, "ls-files", "memory"))
+
+    def test_a_session_s_end_leaves_the_memory_of_another_still_running(self):
+        """The same in main: a session's `commit` there, and its end, leave what another running session
+        wrote."""
+        a, b = "a3a3a3a3-0000-4000-8000-000000000003", "b4b4b4b4-0000-4000-8000-000000000004"
+        ta, tb = self.exchange(a), self.exchange(b)
+        self.start(a, CLAUDE_CODE_SESSION_ID=a)
+        self.start(b, CLAUDE_CODE_SESSION_ID=b)
+        m = self.w / "memory/b.md"
+        m.write_text("---\nname: b\n---\nb\n")
+        self.wrote(tb, m)
+        (self.w / "notes/n.md").write_text("n\n")
+        self.assertIn(f"left memory/b.md for session {b[:8]}",
+                      self.cudl("commit", "-m", "notes", env={"CLAUDE_CODE_SESSION_ID": a}).stdout)
+        committed = self.git(self.w, "show", "--name-only", "--format=", "HEAD").split()
+        self.assertIn("notes/n.md", committed)
+        self.assertNotIn("memory/b.md", committed)
+        self.session("session-end", a, self.w)
+        self.assertIn("?? memory/b.md", self.git(self.w, "status", "--porcelain"))
+
+    def test_a_feature_session_s_context_gives_lab_paths_whole(self):
+        """In a feature, the context gives the session log's path absolute, and the line shown to the user
+        gives it from the main lab: a bare journal/... reads against the main lab (a lab's
+        feedback)."""
+        self.cudl("new", "f1", "-r", "alpha")
+        f = self.w / "wt/f1"
+        sid = "c5c5c5c5-0000-4000-8000-000000000005"
+        out = json.loads(self.cudl("hook", "session-start", input=json.dumps({"session_id": sid, "cwd": str(f)}),
+                                   cwd=f).stdout)
+        log = next((f / "journal/sessions").glob(f"*-f1-{sid[:8]}.md"))
+        self.assertIn(f"Session log: {log}.", out["hookSpecificOutput"]["additionalContext"])
+        self.assertIn(f"log wt/f1/journal/sessions/{log.name}", out["systemMessage"])
+
+    def test_the_context_says_go_stamps_the_lab_s_commit(self):
+        """A code repo with a go.mod at its top: the context says how Go stamps builds there (it finds
+        a repository only by a .git directory; a lab's feedback)."""
+        a = self.w / "code/alpha"
+        (a / "go.mod").write_text("module example.org/alpha\n")
+        self.git(a, "add", "go.mod")
+        self.git(a, "commit", "-q", "-m", "go")
+        ctx = json.loads(self.start("c6c6c6c6-0000-4000-8000-000000000006").stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("-buildvcs=false", ctx)
+        self.assertIn("code/alpha", ctx.split("-buildvcs=false")[0].splitlines()[-1])
+        (a / "go.mod").unlink()
+        self.git(a, "commit", "-q", "-am", "no go")
+        ctx = json.loads(self.start("c7c7c7c7-0000-4000-8000-000000000007").stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("-buildvcs", ctx)
+
+
+    def test_main_s_commit_leaves_the_memory_another_session_staged(self):
+        """Another running session's memory file, staged (its own commit failed, say): a whole `commit` in
+        main leaves it out of the commit too, not only out of what it stages (Codex's code review)."""
+        a, b = "a5a5a5a5-0000-4000-8000-000000000005", "b6b6b6b6-0000-4000-8000-000000000006"
+        self.exchange(a)
+        tb = self.exchange(b)
+        self.start(a, CLAUDE_CODE_SESSION_ID=a)
+        self.start(b, CLAUDE_CODE_SESSION_ID=b)
+        m = self.w / "memory/b.md"
+        m.write_text("---\nname: b\n---\nb\n")
+        self.wrote(tb, m)
+        self.git(self.w, "add", "memory/b.md")
+        (self.w / "notes/n.md").write_text("n\n")
+        self.cudl("commit", "-m", "notes", env={"CLAUDE_CODE_SESSION_ID": a})
+        self.assertNotIn("memory/b.md", self.git(self.w, "show", "--name-only", "--format=", "HEAD").split())
+        self.assertTrue(m.is_file())
+
+    def test_a_codex_rename_of_a_memory_is_its_writer_s(self):
+        """A Codex patch that moves a memory file names the new one in `*** Move to:` (Codex's code review)."""
+        a, b = "a7a7a7a7-0000-4000-8000-000000000007", "b8b8b8b8-0000-4000-8000-000000000008"
+        self.exchange(a)
+        tb = self.root / ".codex/sessions/2026/10/24" / f"rollout-2026-10-24T00-00-00-{b}.jsonl"
+        tb.parent.mkdir(parents=True)
+        tb.write_text("")
+        old, new = self.w / "memory/old.md", self.w / "memory/new.md"
+        old.write_text("---\nname: old\n---\nx\n")
+        self.cudl("commit", "-m", "a memory")
+        self.start(a, CLAUDE_CODE_SESSION_ID=a)
+        self.start(b, agent="codex", CODEX_THREAD_ID=b)
+        self.cudl("new", "f1", env={"CLAUDE_CODE_SESSION_ID": a})
+        old.rename(new)
+        with open(tb, "a") as f:
+            f.write(json.dumps({"type": "response_item", "payload": {"type": "custom_tool_call", "name": "apply_patch",
+                    "input": f"*** Begin Patch\n*** Update File: {old}\n*** Move to: {new}\n@@\n x\n*** End Patch\n"}}) + "\n")
+        (self.w / "wt/f1/notes/n.md").write_text("n\n")
+        self.cudl("commit", "-f", "f1", "-m", "notes", env={"CLAUDE_CODE_SESSION_ID": a})
+        self.assertIn("memory/old.md", self.git(self.w, "ls-tree", "-r", "--name-only", "HEAD", "memory"))
+        self.assertNotIn("memory/new.md", self.git(self.w, "ls-tree", "-r", "--name-only", "HEAD", "memory"))
 
 
 if __name__ == "__main__":

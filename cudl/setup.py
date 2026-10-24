@@ -117,7 +117,7 @@ def upgrade_user_file(w, rel, take):
 
     Provenance, in order: the hash recorded when cudl last wrote the file (authoritative); else
     whether it matches any past template version (the tool repo's history); else unknown, and
-    it is kept. An edited file is replaced only with --take.
+    it is kept. An edited file is replaced only with --take. Returns whether it replaced the file.
     """
     mine, tmpl = w.top / rel, TEMPLATE / rel
     marker = read_marker(w.top)
@@ -133,7 +133,7 @@ def upgrade_user_file(w, rel, take):
         if current != recorded:
             print(f"note: {rel} was edited here, so it was kept.\n  the difference: diff -u {rel} {tmpl}\n"
                   f"  take the template's: cudl upgrade --take {flag}")
-            return
+            return False
         shutil.copy2(tmpl, mine)
         state = "updated from the template (unedited)"
     else:
@@ -146,10 +146,27 @@ def upgrade_user_file(w, rel, take):
                 "can't tell whether it was edited (no template history)"
             print(f"note: {rel} {why}; kept.\n  the difference: diff -u {rel} {tmpl}\n"
                   f"  take the template's: cudl upgrade --take {flag}")
-            return
+            return False
     marker.setdefault("templates", {})[rel] = template
     write_marker(w.top, marker)
     print(f"{rel}: {state}")
+    return state != "up to date"
+
+
+TOOL_FILES = (".cudl/cudl", ".agents/skills", ".claude/skills", ".codex/hooks.json")
+
+
+def tool_files(top):
+    """{path: content} of the files upgrade replaces (a link's content: where it points)."""
+    out = {}
+    for rel in TOOL_FILES:
+        p = top / rel
+        for f in sorted(p.rglob("*")) if p.is_dir() and not p.is_symlink() else [p]:
+            if f.is_symlink():
+                out[str(f.relative_to(top))] = os.readlink(f)
+            elif f.is_file():
+                out[str(f.relative_to(top))] = f.read_bytes()
+    return out
 
 
 def cmd_upgrade(a):
@@ -157,6 +174,7 @@ def cmd_upgrade(a):
     require_main(w)
     if not TEMPLATE.is_dir():
         raise CudlError("run upgrade from the cudl tool repository")
+    before = tool_files(w.top)
     install_tool(w.top)
     install_lab_hooks(w)
     backfill_keeps(w)
@@ -165,18 +183,29 @@ def cmd_upgrade(a):
     claude_files(w.top)
     (w.top / ".codex").mkdir(exist_ok=True)
     shutil.copy2(TEMPLATE / ".codex" / "hooks.json", w.top / ".codex" / "hooks.json")
+    after = tool_files(w.top)
+    # a skill counts once, however many of its files changed
+    skill = (".agents/skills/", ".claude/skills/")
+    changed = list(dict.fromkeys("/".join(k.split("/")[:3]) if k.startswith(skill) else k
+                                 for k in sorted(before.keys() | after.keys()) if before.get(k) != after.get(k)))
     for src in TEMPLATE.rglob("*"):
         dst = w.top / src.relative_to(TEMPLATE)
         if src.is_dir() and not src.is_symlink():
             dst.mkdir(exist_ok=True)
         elif not dst.exists() and not dst.is_symlink():
             shutil.copy2(src, dst, follow_symlinks=False)
+            changed.append(str(dst.relative_to(w.top)))  # a file the template gained
     take = set(a.take or [])
-    for flag, rel in USER_FILES.items():
-        upgrade_user_file(w, rel, flag in take)
-    print("updated .cudl/cudl, the skills and .codex/hooks.json; review with git diff, then cudl commit\n"
-          "features made earlier get the upgrade with `cudl sync` in each feature\n"
-          "codex: re-trust changed hooks in /hooks")
+    wrote = [rel for flag, rel in USER_FILES.items() if upgrade_user_file(w, rel, flag in take)]
+    if changed:
+        print(f"updated {', '.join(changed)}")
+    elif not wrote:
+        print("the tool's files were up to date")
+        return
+    print("review with git diff, then cudl commit\n"
+          "features made earlier get the upgrade with `cudl sync` in each feature")
+    if ".codex/hooks.json" in changed:
+        print("codex: re-trust the changed hooks in /hooks")
 
 
 def link(src, dst):

@@ -12,13 +12,13 @@ from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
 from cudl.core import (
-    CudlError, GIT, busy, changed_paths, common_dir, conflicted, git, git_ok, has_staged,
+    CudlError, GIT, busy, changed_paths, code_strays, common_dir, conflicted, git, git_ok, has_staged,
     head_branch, head_sha, is_ancestor, is_checkout, lab_lock, mib, pinned, pinned_head, porcelain, run,
     short, split_path, stale_pin, tree,
 )
 from cudl.lab import Lab, base_of, base_problem, keep_pins, keep_since, pins_in
 from cudl.journal import (
-    INDEX, SESSION_DIRS, build_index, commit_ended_logs, commit_session_dirs, ended_leftovers,
+    INDEX, SESSION_DIRS, build_index, commit_leftover_logs, commit_session_dirs, log_leftovers,
     readable_frontmatter, session_file, sessions_dir,
 )
 from cudl.stack import (
@@ -51,11 +51,14 @@ def keep_ignored(main, fw, stamp=None):
     """`git worktree remove` deletes ignored files, so the lab worktree's (scratch/, journal/raw/: the
     lab's working material) first go to the main lab's scratch/<feature>-<stamp>/. Its settings.local.json,
     which `cudl setup` writes, doesn't count. Code checkouts' ignored files, their projects' build
-    output, go with them as with any worktree removal."""
+    output, go with them as with any worktree removal. What's beside them under code/, ignored or
+    untracked (code_strays: the removal would refuse it), goes to scratch/ too."""
     out = run(GIT + ["status", "--porcelain=v1", "-z", "--ignored=matching", "--ignore-submodules=all"],
               fw.top).stdout
+    repos = [r.path for r in fw.repos().values()]
     paths = [e[3:].rstrip("/") for e in out.split("\0") if e.startswith("!! ")]
-    paths = [p for p in paths if p != ".claude/settings.local.json" and p.split("/")[0] != "code"]
+    paths = [p for p in paths if p != ".claude/settings.local.json"
+             and not any(p == r or p.startswith(r + "/") for r in repos)] + code_strays(fw.top)
     if not paths:
         return None
     base = Path(main) / "scratch" / f"{fw.feature}-{stamp or datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -66,7 +69,7 @@ def keep_ignored(main, fw, stamp=None):
     for p in paths:
         (dest / p).parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(fw.top / p), str(dest / p))
-    print(f"kept {fw.feature}'s ignored files ({', '.join(paths[:3])}{' …' if len(paths) > 3 else ''}) "
+    print(f"kept {fw.feature}'s untracked files ({', '.join(paths[:3])}{' …' if len(paths) > 3 else ''}) "
           f"in {dest.relative_to(main)}/")
     return dest
 
@@ -353,7 +356,7 @@ def plan_finish(main, feat, no_ff, keep):
                             + (f"finish {parent} first, or the whole stack: cudl finish --stack {feat}" if state == "live" else
                                f"run `cudl sync` in {feat} first, so it follows the integration branches "
                                f"(or `cudl finish --stack {feat}`, which does)"))
-    problems = clean_problems(fw, skip=ended_leftovers(fw)) + wrong_branches(fw, feat) + \
+    problems = clean_problems(fw, skip=log_leftovers(fw)) + wrong_branches(fw, feat) + \
         ([] if keep else sessions_in_the_way(main, feat))
     owned = [r for r in fw.repos().values() if head_branch(ftop / r.path) == feat]
     # an older pin of main's that the lab merge would put back (an older cudl's sync could leave one)
@@ -380,7 +383,7 @@ def plan_finish(main, feat, no_ff, keep):
     if problems:
         raise NothingMerged("nothing merged:\n  " + "\n  ".join(problems))
     adopt_legacy(main)  # before the first write: a legacy parent retained by this finish stays live
-    commit_ended_logs(fw, f"finishing {feat}")
+    commit_leftover_logs(fw, f"finishing {feat}")
     record_moved_pins(fw, "finish")
     keep_pins(main, pins_in(main.main, [f"feat/{feat}"]))  # whatever happens next, its pins stay
     # what main_problems let through, the sessions' tracked files, in a commit of their own: a checkpoint
@@ -621,7 +624,7 @@ def preflight_stack(main, chain):
             problems.append(f"{feat}: no live feature at {ftop}")
             continue
         fw = Lab(ftop)
-        problems += [f"{feat}: {p}" for p in clean_problems(fw, skip=ended_leftovers(fw)) + wrong_branches(fw, feat)
+        problems += [f"{feat}: {p}" for p in clean_problems(fw, skip=log_leftovers(fw)) + wrong_branches(fw, feat)
                      + sessions_in_the_way(main, feat, notes=False)]
         parent = lab_parent(main, feat)
         state, done = parent_end(main, feat)

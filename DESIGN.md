@@ -379,6 +379,37 @@ destructive, clean worktrees before removal, and a main lab with no pending chan
   log; pin selection ran before the lock and plain `commit` didn't lock; `finish` committed a
   running session's log (its index now lists only committed logs).
 - `sync --rebase` and a resumable `finish --stack` came next (next section).
+- The labs' feedback of October, after a month of use:
+  - **`code/` holds only the code repos.** What's untracked there (a build link, a clone) is never
+    staged by `commit` or `sync` (excluded from their `add -A`, with a note); the checks before a
+    sync or a finish don't count it; and removing a feature keeps it, with what's ignored there
+    beside the repos, in the main lab's `scratch/<feature>-<stamp>/` (git would refuse the untracked,
+    and delete the ignored). A tracked file under `code/` stays the user's.
+  - **Memory another running session wrote** is that session's to commit. A session's commit of the
+    shared `memory/` (`commit -f`, a whole `commit` in main, its end) leaves a changed file that a
+    session still running (a log without `ended:`, not a subagent) wrote, by its transcript, and this
+    one didn't: Claude Code's file tools, Codex's patches (a move's new file too, a relative path
+    against the rollout's working directory); a mention elsewhere doesn't count. It is judged under
+    the lab lock on exactly what is committed, and a whole commit in main unstages what it leaves. A
+    commit without a session, the user's from a shell, takes everything: a session that crashed never
+    ends, and what it wrote would wait for good.
+  - **`new` checks signing first** (a dangling commit of the empty tree, as `split` does): its start
+    commit comes after the worktrees and branches. The probe gives up after 30 s
+    (`CUDL_SIGNING_PROBE_TIMEOUT`), signer and all: a forwarded SSH agent whose connection went away
+    can take the request and never answer. If the start commit fails all the same, the error says
+    what completes the feature.
+  - **What sync and finish commit as it is**: the logs of sessions that ended, and the linked logs of
+    sessions working in the feature from elsewhere (`role: continued`, no `running_since:`), which a
+    removal doesn't strand: after a finish their end closes them in main. What still stops them says
+    whose log it is, and what commits it.
+  - **Paths a session is given**: in a feature, the start context's lab paths are absolute (the
+    user reads a bare `journal/…` as the main lab's, which has files of the same names), and the line
+    shown to the user gives them from the main lab; `AGENTS.md` asks the same of the agent.
+  - **Go's VCS stamp**: Go finds a repository only by a `.git` directory (checked with 1.25), and a
+    code checkout's is a file, so a build there stamps the lab's commit as `vcs.revision`. The start
+    context says so when a checkout has a `go.mod`.
+  - **`upgrade`** compares its files before and after (content, and where links point) and says which
+    changed; Codex's re-trust only when `.codex/hooks.json` did.
 
 ## Rewritten parents and finishing stacks
 
@@ -1088,6 +1119,12 @@ Open:
   one under a copy is refused (`--rebase-merges`, or a script, keeps merges and their copies); a key
   two commits share matches nothing; a feature that already merged the new copies holds both,
   unnoticed; the old lab tip is kept only in the reflog (every tree is the same, so no pin is lost).
+- Memory another running session wrote ("A helper, not a gatekeeper"): a write no transcript shows
+  (a shell command's) is anybody's, as before; a file two sessions wrote (`MEMORY.md`, typically) goes
+  with whichever commits first; a session that crashed, never ended, keeps the files it wrote out of
+  the other sessions' commits until the user's own commit takes them; reading the running sessions'
+  transcripts costs time on long ones (a third of a second on 240 MB), and is done only when memory
+  changed.
 - The known limits in "Sessions: what cudl promises" and "Worktree exits, notices and the memory
   index".
 

@@ -18,8 +18,8 @@ from cudl.core import (
 )
 from cudl.lab import Lab, keep_since, lab_tops, read_marker, repo_line
 from cudl.journal import (
-    build_index, commit_memory, commit_with_index, create_log, drop_frontmatter, parse_frontmatter,
-    read_frontmatter, readable_frontmatter, select_paths, session_file, sessions_dir,
+    build_index, commit_session_dirs, commit_with_index, create_log, drop_frontmatter,
+    parse_frontmatter, read_frontmatter, readable_frontmatter, select_paths, session_file, sessions_dir,
     update_frontmatter,
 )
 from cudl.stack import lab_parent, parent_state
@@ -405,6 +405,22 @@ def hook_lab(data):
     return Lab.find(hook_target(data))
 
 
+def lab_path(w, rel):
+    """A path of this worktree's lab, as a session's context gives it: from the lab's top in main, and
+    absolute in a feature, where the user would read a lab-relative path as main's (main has files of
+    the same names)."""
+    return str(w.top / rel) if w.feature else str(rel)
+
+
+def go_note(w):
+    """Go finds a repository only by a .git directory (checked with Go 1.25); a code checkout's .git is a
+    file (a submodule's, a worktree's), so its builds stamp the enclosing lab's commit."""
+    gomods = [lab_path(w, r.path) for r in w.repos().values() if (w.top / r.path / "go.mod").is_file()]
+    return (f"Go builds in {', '.join(gomods)} stamp the lab's commit as vcs.revision, not the code's (Go "
+            f"finds a repository only by a .git directory, and a code checkout's .git is a file): build with "
+            f"-buildvcs=false, and pass the code's commit by -ldflags where the program takes one.") if gomods else ""
+
+
 def subagent_context(w, sf, parent):
     return "\n".join([
         f"cudl: this session was started by session {parent} in the cudl {w.top}"
@@ -412,7 +428,7 @@ def subagent_context(w, sf, parent):
         "Do the task you were given and report back. Don't commit, don't run /wrap, and don't edit",
         "handoff/, journal/ or memory/ unless the task says so: the session that started you owns them.",
         "Code is in code/<repo>; notes and plans in the lab; AGENTS.md has the rules.",
-        f"This run is logged in {sf.relative_to(w.top)} under its parent.",
+        f"This run is logged in {lab_path(w, sf.relative_to(w.top))} under its parent.",
     ])
 
 
@@ -431,7 +447,8 @@ def session_context(w, sf, source, agent="claude", home=None):
     where = (f"feature `{w.feature}` ({w.top}, lab branch feat/{w.feature}"
              + (f", stacked on {parent}" + (f", which is {pstate}" if pstate != "live" else "") if parent else "")
              + ")") if w.feature else f"the main lab ({w.top})"
-    lines = [f"cudl: this session is in {where}. Session log: {sf.relative_to(w.top)}."]
+    log = lab_path(w, sf.relative_to(w.top))
+    lines = [f"cudl: this session is in {where}. Session log: {log}."]
     for r in w.repos().values():
         lines.append("  " + repo_line(w.top, r))
     lines.append(f"Shared memory: {w.main / 'memory'}. Plans: {w.top / 'plans'}.")
@@ -449,23 +466,24 @@ def session_context(w, sf, source, agent="claude", home=None):
                 text = text[:MEMORY_INDEX_LIMIT] + "\n[… truncated; read the file for the rest]"
             lines += ["", "## Memory index (memory/MEMORY.md; see AGENTS.md › Memory)", text.strip()]
     if source == "compact":
-        lines.append(f"(The context was just compacted; the session log is {sf.relative_to(w.top)}.)")
+        lines.append(f"(The context was just compacted; the session log is {log}.)")
     # the handoff of where the work is now: the most recent feature, for a session that moved
     if last and last != w.label and w.feature_top(last).is_dir():
         text = handoff_text(w.feature_top(last), last)
         if text:
-            lines += ["", f"## Handoff of {last}, where this session last worked (wt/{last}/handoff/{last}.md)",
-                      text.strip()]
-        lines.append(f"(This worktree's own handoff: handoff/{w.label}.md.)")
+            there = w.feature_top(last) / "handoff" / f"{last}.md" if w.feature else f"wt/{last}/handoff/{last}.md"
+            lines += ["", f"## Handoff of {last}, where this session last worked ({there})", text.strip()]
+        lines.append(f"(This worktree's own handoff: {lab_path(w, f'handoff/{w.label}.md')}.)")
     else:
         text = handoff_text(w.top, w.label)
         if text:
-            lines += ["", f"## Handoff (handoff/{w.label}.md)", text.strip()]
+            lines += ["", f"## Handoff ({lab_path(w, f'handoff/{w.label}.md')})", text.strip()]
     index = w.top / "journal" / "INDEX.md"
     if index.exists():
         entries = [l for l in index.read_text().splitlines() if l.startswith("- ")]
-        if entries:
-            lines += ["", "## Recent sessions (journal/INDEX.md)"] + entries[-RECENT_SESSIONS:]
+        if entries:  # the index's links are from journal/: the context gives them as its other paths
+            lines += ["", f"## Recent sessions ({lab_path(w, 'journal/INDEX.md')})"] + \
+                [l.replace("](sessions/", f"]({lab_path(w, 'journal/sessions')}/") for l in entries[-RECENT_SESSIONS:]]
     return "\n".join(lines)
 
 
@@ -502,10 +520,13 @@ def hook_session_start(a):
                                    if fm0.get("role") == "continued" and session_home(w, sid)[1] else None)
     home = session_home(w, sid)[1] if fm0.get("role") == "continued" else None  # speaks for the whole session
     ctx = subagent_context(w, sf, parent) if parent else session_context(w, sf, data.get("source"), a.agent, home)
+    note = go_note(w)
+    if note:
+        ctx += "\n\n" + note
     # the context goes to the agent; one line of it is shown to the user
     where = f"feature {w.feature}" if w.feature else "main lab"
     shown = (f"cudl: subagent of {parent[:8]} in the {where}" if parent else
-             f"cudl: {where} · log {sf.relative_to(w.top)} · handoff "
+             f"cudl: {where} · log {sf.relative_to(w.main)} · handoff "
              + ("loaded" if (w.top / "handoff" / f"{w.label}.md").exists() else "missing"))
     planted = [r.path for r in w.repos().values() if is_checkout(w.top / r.path) and (  # at its top, or tracked
         any((w.top / r.path / n).exists() for n in (".cudl", MARKER))
@@ -575,6 +596,96 @@ def had_exchange(transcript, agent):
     except OSError:
         return True
     return False
+
+
+# The tool calls that write a file: Claude Code's file tools (the path in `file_path`, a notebook's in
+# `notebook_path`), and Codex's patches, whose text names each file (a move's new one in `Move to:`),
+# relative to the session's working directory unless absolute.
+WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+PATCH_FILE_RE = re.compile(r"\*\*\* (?:(?:Add|Update|Delete) File|Move to): ([^\n\\\"]+)")
+
+
+def files_written(transcript, under):
+    """The files directly in directory `under` that a transcript shows its session writing, by a file
+    tool or a patch (a mention elsewhere, a read, doesn't count), relative to under's parent; none if
+    the transcript can't be read."""
+    out, needle, cwd = set(), str(under).encode(), None
+    try:
+        with open(transcript, "rb") as f:
+            for line in f:
+                # what can name a file there: its path, a patch, or a Codex record of the working directory
+                if needle not in line and b"apply_patch" not in line and b'"cwd"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(r, dict):
+                    continue
+                pl = r.get("payload")
+                if isinstance(pl, dict) and r.get("type") in ("session_meta", "turn_context") and pl.get("cwd"):
+                    cwd = str(pl["cwd"])
+                if isinstance(pl, dict) and pl.get("type") in ("function_call", "custom_tool_call"):
+                    text = str(pl.get("input") or pl.get("arguments") or "")
+                    if pl.get("name") == "apply_patch" or "apply_patch" in text:
+                        out.update(os.path.join(cwd, p.rstrip()) if cwd and not p.startswith("/") else p.rstrip()
+                                   for p in PATCH_FILE_RE.findall(text))
+                msg = r.get("message")
+                content = msg.get("content") if isinstance(msg, dict) else None
+                for c in content if isinstance(content, list) else []:
+                    if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("name") in WRITE_TOOLS \
+                            and isinstance(c.get("input"), dict):
+                        out.add(str(c["input"].get("file_path") or c["input"].get("notebook_path") or ""))
+    except (OSError, TypeError, UnicodeDecodeError):
+        return set()
+    under = Path(under)
+    return {str(Path(p).relative_to(under.parent)) for p in map(os.path.normpath, filter(None, out))
+            if Path(p).parent == under}
+
+
+def memory_of_others(w, sid, changed):
+    """{path: session} of these changed files of main's memory/ that another session still running wrote,
+    by its transcript, and session sid didn't: that session's own commit or end takes them. A write no
+    transcript shows (by a shell command, say) is anybody's; a subagent's, its parent's to say. With no
+    session (sid None: yours, from a shell), none: what a session that crashed wrote would wait for good."""
+    mem, theirs = w.main / "memory", {}
+    if not changed or not sid:
+        return theirs
+    running = dict.fromkeys(s for top in lab_tops(w) for s in open_sessions(Lab(top), but=(sid,)))
+
+    def written(s):
+        home = session_home(w, s)[1]
+        fm = readable_frontmatter(home) if home else {}
+        t = None if fm.get("parent") else find_transcript(s, fm.get("agent") or "claude", fm.get("transcript"))
+        return files_written(t, mem) & set(changed) if t else set()
+
+    for s in running:
+        for p in written(s):
+            theirs.setdefault(p, s)
+    mine = written(sid) if theirs and sid else set()
+    return {p: s for p, s in theirs.items() if p not in mine}
+
+
+def say_left(theirs, out=sys.stdout):
+    for p, s in sorted(theirs.items()):
+        print(f"memory: left {p} for session {s[:8]}, which wrote it and is still running (its own commit or end "
+              f"takes it; if that session is gone, yours does: `cudl commit --lab {p}`)", file=out)
+
+
+def commit_memory(w, msg=None, sid=None):
+    """From a feature, commit the shared memory directory on main (not while main is busy), but what
+    another running session wrote (memory_of_others, judged under the lock on what is committed)."""
+    if not (w.main / "memory").is_dir():
+        return False
+    sid, left = sid or current_session(w), {}
+
+    def theirs(take):
+        left.update(memory_of_others(w, sid, take))
+        return left
+
+    done = commit_session_dirs(w, w.main, ["memory"], msg or f"memory: from {w.label}", leave=theirs)
+    say_left(left)
+    return bool(done)
 
 
 def changed_since(top, entries, since):
@@ -684,7 +795,7 @@ def hook_session_end(a):
     if not any(lab.top == lab.main for lab, _ in logs):
         # a session that worked only in features: the shared memory it wrote is on main
         try:
-            commit_memory(w, f"memory: from session {sid[:8]} ({w.label})")
+            commit_memory(w, f"memory: from session {sid[:8]} ({w.label})", sid)
         except CudlError as e:
             print(f"cudl: main's memory/ is not committed: {e}", file=sys.stderr)
 
@@ -761,6 +872,9 @@ def close_log(w, sf, sid, kids=(), transcript=None):
         take, split, states = select_paths(w.top, paths)
         if split:
             print(f"cudl: left alone, staged and then changed again: {', '.join(split[:5])}", file=sys.stderr)
+        theirs = memory_of_others(w, sid, [p for p in take if p.startswith("memory/")]) if w.top == w.main else {}
+        say_left(theirs, sys.stderr)
+        take = [p for p in take if p not in theirs]
         pins = [r for r in record if r.path in take]
         dirs = sorted({p.split("/")[0] for p in take if p.split("/")[0] in ("memory", "plans")})
         msg = (f"journal: session {sid[:8]}" + (f"; pins {', '.join(r.name for r in pins)}" if pins else "")

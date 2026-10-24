@@ -11,17 +11,17 @@ import sys
 from pathlib import Path
 
 from cudl.core import (
-    AGENTS, CudlError, GIT, busy, changed_paths, conflicted, git, git_ok, git_retry, has_staged,
-    head_branch, head_sha, history_pins, in_progress, index_pins, is_ancestor, is_checkout, lab_changes,
-    lab_lock, pinned, pinned_head, porcelain, run, short, stale_pin,
+    AGENTS, CudlError, GIT, busy, changed_paths, check_signing, code_strays, conflicted, git, git_ok,
+    git_retry, has_staged, head_branch, head_sha, history_pins, in_progress, index_pins, is_ancestor,
+    is_checkout, lab_changes, lab_lock, pinned, pinned_head, porcelain, run, short, stale_pin, status_entries,
 )
 from cudl.lab import (
     KEEP, Lab, base_of, base_problem, keep_since, lab_tops, require_feature, setup_local,
     validate_name,
 )
 from cudl.journal import (
-    build_commit_index, build_index, commit_ended_logs, commit_memory, ended_leftovers, session_file,
-    update_frontmatter,
+    build_commit_index, build_index, commit_leftover_logs, log_leftovers, readable_frontmatter,
+    session_file, update_frontmatter,
 )
 from cudl.stack import (
     adopt_legacy, feature_live, finish_destinations, follow_base, forget_rebase, lab_cfg,
@@ -30,8 +30,8 @@ from cudl.stack import (
     stacked_repos,
 )
 from cudl.sessions import (
-    PARENT_ENV, SESSION_ID_RE, current_session, hook_input, hook_target, link_session,
-    pins_to_record,
+    PARENT_ENV, SESSION_ID_RE, commit_memory, current_session, hook_input, hook_target, link_session,
+    memory_of_others, pins_to_record, say_left,
 )
 
 
@@ -109,6 +109,7 @@ def cmd_new(a, quiet=False):
             raise CudlError(f"--handoff-from {seed}: no such file, and no feature with a committed "
                             f"handoff/{seed}.md" if handoff_from else f"--from {seed}: no committed handoff/{seed}.md")
         seeded = got.stdout, f"handoff/{seed}.md"
+    check_signing(main, "nothing was made")  # its start commit comes after the worktrees and branches
 
     git(main, "worktree", "add", "-q", "-b", f"feat/{feat}", str(top), f"feat/{parent}" if parent else "HEAD")
     git(main, "config", f"branch.feat/{feat}.cudlid", os.urandom(6).hex())
@@ -143,7 +144,12 @@ def cmd_new(a, quiet=False):
     old = pinned_head(top)
     git(top, "add", "-A")
     if has_staged(top):
-        git(top, "commit", "-q", "-m", f"cudl: start feature {feat}" + (f" from {parent}" if parent else ""))
+        start = f"cudl: start feature {feat}" + (f" from {parent}" if parent else "")
+        try:
+            git(top, "commit", "-q", "-m", start)
+        except CudlError as e:
+            raise CudlError(f"{e}\n{feat} is made, all but its start commit: once commits work, "
+                            f"`cudl commit -f {feat} -m \"{start}\"` completes it") from None
     keep_since(fw, old)
     link_session(fw, quiet=True)
     if not quiet:
@@ -345,7 +351,7 @@ def cmd_commit(a):
                                        if p.startswith("journal/sessions/")])
         else:
             build_index(w.top)
-        old = pinned_head(w.top)
+        old, strays = pinned_head(w.top), []
         moved = [r.path for r in repos.values() if is_checkout(w.top / r.path) and pinned(w.top, r.path) != head_sha(w.top / r.path)
                  and git_ok(w.top, "diff", "--cached", "--quiet", "--", r.path)]  # a pin staged by hand stays as staged
         only = [*a.lab, *moved, "journal/INDEX.md"] if a.lab else None  # only these lab paths, plus the pins
@@ -356,7 +362,14 @@ def cmd_commit(a):
             if there:
                 git(w.top, "add", "--", *there)
         else:
-            git(w.top, "add", "-A")
+            strays = add_all(w.top)
+            # in main, what another running session wrote in the shared memory is its own to commit
+            staged = [] if w.feature or merging else git(w.top, "diff", "--cached", "--name-only", "-z", "--",
+                                                          "memory").split("\0")
+            theirs = memory_of_others(w, current_session(w), [p for p in staged if p])
+            if theirs:
+                git(w.top, "--literal-pathspecs", "reset", "-q", "--", *theirs)  # its file stays as it is
+                say_left(theirs)
         if (only and not git_ok(w.top, "diff", "--cached", "--quiet", "--", *only)) or \
                 (not only and (has_staged(w.top) or merging)):
             trailers = []
@@ -372,6 +385,10 @@ def cmd_commit(a):
             print(f"lab: {short(head_sha(w.top))} on {head_branch(w.top)}")
         elif not done:
             print("nothing to commit")
+    if strays:
+        names = list(dict.fromkeys("/".join(p.split("/")[:2]) for p in strays))  # an untracked directory, once
+        print(f"note: left out {', '.join(names[:3])}{' …' if len(names) > 3 else ''}: code/ holds only the "
+              f"code repos; it stays, untracked (a finish keeps it in scratch/)")
     if w.feature and not a.no_memory and commit_memory(w):
         print("memory: committed on main")
     if unstaged:
@@ -452,6 +469,13 @@ def resolve_generated(top, conflicts, repos, gitlinks=True):
     return remaining
 
 
+def add_all(top):
+    """Stage every lab change but what's untracked under code/ (code_strays); returns that."""
+    strays = code_strays(top)
+    git(top, "add", "-A", "--", ".", *[f":(exclude,literal){p}" for p in strays])
+    return strays
+
+
 def check_clean(fw, what, ignore=()):
     """Nothing uncommitted in a feature worktree but the lab paths in `ignore`."""
     problems = []
@@ -459,7 +483,8 @@ def check_clean(fw, what, ignore=()):
         d = fw.top / r.path
         if is_checkout(d) and porcelain(d):
             problems.append(f"{r.name} has uncommitted changes")
-    if [l for l in lab_changes(fw.top) if l[3:] not in ignore]:
+    ignore = {*ignore, *code_strays(fw.top)}
+    if [p for _, _, p in status_entries(fw.top) if p.rstrip("/") not in ignore]:
         problems.append("the lab has uncommitted changes (or unrecorded code commits)")
     if problems:
         raise CudlError(f"{what}: commit first (cudl commit):\n  " + "\n  ".join(problems))
@@ -530,8 +555,8 @@ def record_moved_pins(w, why):
 
 def clean_problems(fw, skip=()):
     """What stops a sync or finish: uncommitted work, an operation in progress. Moved pins that
-    `record_moved_pins` would record don't count, nor the paths in `skip` (ended_leftovers: the caller
-    commits those)."""
+    `record_moved_pins` would record don't count, nor what's untracked under code/ (code_strays), nor the
+    paths in `skip` (log_leftovers: the caller commits those)."""
     problems = []
     for r in fw.repos().values():
         d = fw.top / r.path
@@ -543,15 +568,30 @@ def clean_problems(fw, skip=()):
         elif porcelain(d):
             problems.append(f"{r.name} has uncommitted changes")
     recordable = {r.path for r in pins_to_record(fw)}
+    skip = {*skip, *code_strays(fw.top)}
     what = busy(fw.top)
     if what:
         problems.append(f"the lab has {what} in progress")
     else:
-        changed = [l[3:] for l in lab_changes(fw.top) if l[3:] not in recordable and l[3:] not in skip]
+        changed = list(dict.fromkeys(p for _, _, p in status_entries(fw.top)
+                                     if p not in recordable and p.rstrip("/") not in skip))
         if changed:
             problems.append(f"the lab has uncommitted changes: {', '.join(changed[:4])}" + (" …" if len(changed) > 4 else "")
-                            + (" (a session still running there?)" if any(c.startswith("journal/sessions/") for c in changed) else ""))
+                            + logs_hint(fw, [c for c in changed if c.startswith("journal/sessions/")]))
     return problems
+
+
+def logs_hint(fw, logs):
+    """Whose these uncommitted session logs are, and what commits them."""
+    me, says = current_session(fw), []
+    for p in logs:
+        fm = readable_frontmatter(fw.top / p) if (fw.top / p).is_file() else {}
+        s = fm.get("session")
+        if not s:
+            continue
+        says.append("this session's log: `cudl commit` it first" if s == me else
+                    f"session {s[:8]}'s log: it is running there; its `cudl commit`, or its end, commits it")
+    return f" ({'; '.join(dict.fromkeys(says))})" if says else ""
 
 
 def cmd_sync(a):
@@ -566,7 +606,7 @@ def sync_feature(w, rebase=False, force=False, reparent_abandoned=False, link=Tr
     child of a rewritten parent has its own commits moved onto it (see rebase_checks)."""
     feat = w.feature
     repos = w.repos()
-    problems = clean_problems(w, skip=ended_leftovers(w))
+    problems = clean_problems(w, skip=log_leftovers(w))
     if problems:
         raise CudlError("sync: commit first (cudl commit):\n  " + "\n  ".join(problems))
     parent = lab_parent(w, feat)
@@ -620,7 +660,7 @@ def sync_feature(w, rebase=False, force=False, reparent_abandoned=False, link=Tr
     adopt_legacy(Lab(w.main))  # freezes the judgements made above (ids for features made before them)
     if link:
         link_session(w)
-    commit_ended_logs(w, "syncing")
+    commit_leftover_logs(w, "syncing")
     record_moved_pins(w, "sync")
     old = pinned_head(w.top)
     for s in todo:
@@ -706,7 +746,7 @@ def sync_feature(w, rebase=False, force=False, reparent_abandoned=False, link=Tr
                     continue
                 print(f"{r.name}: checked out at {short(pin)}, pinned (`cudl take {r.name}` to work on it)")
         build_index(w.top)
-        git(w.top, "add", "-A")
+        add_all(w.top)
         if has_staged(w.top):
             git(w.top, "commit", "-q", "-m", f"cudl: sync {feat} with {main_branch}")
     keep_since(w, old)

@@ -677,7 +677,7 @@ class TestFinish(CudlTest):
         f, log = self.ended_but_uncommitted()
         p = self.cudl("finish", "f1", check=False, env=self.broken_signing())
         self.assertNotEqual(p.returncode, 0)
-        self.assertIn(f"couldn't be committed (journal/sessions/{log.name})", p.stderr)
+        self.assertIn(f"logs couldn't be committed (journal/sessions/{log.name})", p.stderr)
         self.assertIn("SSH_AUTH_SOCK is not set", p.stderr)
         self.assertEqual(p.stderr.count("commit signing is on"), 1)
         self.assertTrue(log.is_file())
@@ -710,6 +710,44 @@ class TestFinish(CudlTest):
         p = self.cudl("finish", "f1", check=False)
         self.assertNotEqual(p.returncode, 0)
         self.assertTrue(f.is_dir())
+
+
+    def test_finish_commits_the_log_of_a_session_working_there_from_elsewhere(self):
+        """A session in main made the feature (its linked log there, made after the start commit) and
+        committed code with plain git; the user's finish commits that log as it is, as the note says its
+        end closes it wherever it is. It refused: "a session still running there?" (a lab's feedback)."""
+        s = "f0f0f0f0-0000-4000-8000-000000000001"
+        self.start(s, CLAUDE_CODE_SESSION_ID=s)
+        self.cudl("new", "f1", "-r", "alpha", env={"CLAUDE_CODE_SESSION_ID": s})
+        f = self.w / "wt/f1"
+        log = next((f / "journal/sessions").glob(f"*-f1-{s[:8]}*.md"))
+        self.assertIn(log.name, self.git(f, "status", "--porcelain"))
+        (f / "code/alpha/x").write_text("x\n")
+        self.git(f / "code/alpha", "add", "-A")
+        self.git(f / "code/alpha", "commit", "-q", "-m", "plain git")
+        self.cudl("finish", "f1")
+        self.assertFalse(f.exists())
+        self.assertIn(log.name, self.git(self.w, "ls-tree", "--name-only", "HEAD", "journal/sessions/"))
+        self.assertIn(log.name, self.sh("git", "show", "HEAD:journal/INDEX.md").stdout)
+        home = next((self.w / "journal/sessions").glob(f"*-main-{s[:8]}*.md"))
+        self.assertEqual([l[3:] for l in self.git(self.w, "status", "--porcelain").splitlines()],
+                         [f"journal/sessions/{home.name}"])  # the running session's own, in main
+        self.session("session-end", s, self.w)  # its end closes the linked log, now in main
+        self.assertIn("ended:", self.sh("git", "show", f"HEAD:journal/sessions/{log.name}").stdout)
+
+    def test_sync_names_the_session_whose_log_is_uncommitted(self):
+        """What still stops a sync, a running session's own log, comes with whose it is and what to do."""
+        sid = "f0f0f0f0-0000-4000-8000-000000000002"
+        self.cudl("new", "f1", "-r", "alpha")
+        f = self.w / "wt/f1"
+        self.session("session-start", sid, f)
+        log = next((f / "journal/sessions").glob(f"*-f1-{sid[:8]}*.md"))
+        log.write_text(log.read_text() + "a line its session wrote\n")
+        p = self.cudl("sync", cwd=f, check=False, env={"CLAUDE_CODE_SESSION_ID": sid})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("this session's log", p.stderr)
+        p = self.cudl("sync", cwd=f, check=False)
+        self.assertIn(f"session {sid[:8]}", p.stderr)
 
 
 if __name__ == "__main__":
