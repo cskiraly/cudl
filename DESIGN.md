@@ -883,6 +883,41 @@ checkout, or one the lab never pinned) stays its own, as before.
   feature's own tip may be older than main's pin, which only matters if the merge would take it.
   `cudl sync` repairs it.
 
+## The status page
+
+One lab kept a one-screen "where are we" page, `STATUS.md`, at its main lab's top: running, waiting on
+the user, next for the agent, open, features, code pins, recently done. Every session edited the one
+file, feature sessions included, in the same turn as any change: 85 commits in two days, three
+sessions on one of them. Nothing serialised the edits (a scripted `sed -i` doesn't check that the file
+changed since it was read), a feature session left its edit for the main session to commit, and the
+one `Updated:` line carried every session's clauses. cudl now writes such a page itself.
+
+- **One fragment per worktree**, `status/<label>.md` in the main lab, written only through `cudl status
+  set <section> <text>` (or `clear`): the section is replaced, under the lab lock, and that one path is
+  committed on main at once, as feedback entries are. Each section carries its own time and session.
+  A feature's fragment records the feature's id (a feature from before ids gets one first), so a
+  later feature of the same name starts afresh. What a write whose commit failed left is committed as
+  it is before the next write changes it, so whatever a `set` replaces is in git.
+- **The page is a view**: `STATUS.md` is written from the fragments of the live worktrees and what
+  cudl knows (each worktree's code, its pins when a checkout differs, its last session; the sessions
+  running), under the lab lock so an older write can't replace a newer one, and git ignores it (cudl
+  adds it to the lab's `info/exclude`). A committed page would hold those facts as of its last commit,
+  and every refresh would be a commit or a dirty main lab that stops a finish; the fragments are the
+  history. It is written after every command that can change what it shows, from `main()` (the
+  main lab found before the command runs, since a finish can remove the worktree it ran in; after a
+  failure too), and never fails its command. Not after `keep`, which the lab's git hooks run inside
+  cudl's own commits, holding the lock.
+- `status/` is a session directory: a fragment left changed (its commit failed) is taken by a finish's
+  checkpoint like memory; a new one whose first commit failed waits for the next write of its worktree.
+- The sessions running are those whose logs have no `ended:`, shown where they started, or where a
+  start ran since (a session resumed in a feature).
+- A page cudl didn't write (tracked, or without its header) is never replaced: `set` refuses before it
+  writes and says how to move the page aside. Fragments of finished features are left out of the page
+  but for the five most recent, one line each.
+- Known limits: two sessions of one worktree (the main lab, usually) writing the same section at once:
+  the later replaces the earlier, and `set` says whose text it replaced and the commit that has it. A
+  change made with plain git shows at the next cudl command, or `cudl status page`.
+
 ## The `cudl` tool
 
 A single stdlib-only Python script, with skills on top, for the chores of the two-level git.

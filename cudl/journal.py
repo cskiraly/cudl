@@ -21,8 +21,9 @@ INDEX_HEADER = (
 
 
 # What sessions write as they go, without anyone deciding to commit it: auto memory (main's memory/,
-# shared by every worktree), plan mode (the session's plans/), and the session logs with their index.
-SESSION_DIRS = ("memory", "plans", "journal")
+# shared by every worktree), plan mode (the session's plans/), the session logs with their index, and
+# the status page's fragments (main's status/, which `cudl status set` commits as it writes them).
+SESSION_DIRS = ("memory", "plans", "journal", "status")
 
 
 INDEX = "journal/INDEX.md"

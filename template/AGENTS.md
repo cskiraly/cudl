@@ -43,6 +43,10 @@ the memory, journal and handoffs.
   would be a file of the repository's own. Point the user to a feature's file by its path from the
   main lab (`wt/<feature>/notes/x.md`) or an absolute one: they read paths against the main lab,
   which has files of the same names. Links inside lab files stay lab-relative.
+- If the main lab has a `status/`, its `STATUS.md` is a page cudl writes from each worktree's
+  status: change your worktree's part with `.cudl/cudl status set [-f <feature>] <section> "<text>"`
+  (Running, Waiting on you, Next, Open, Recently done, or another; no text removes it), never
+  `STATUS.md` itself.
 - `.cudl/cudl status` and `.cudl/cudl ls` show where things stand; `.cudl/cudl squash` folds a
   feature's commits into one. When a feature's parent was rewritten, `.cudl/cudl sync -f
   <feature> --rebase` moves the feature's own commits onto it; with `--force` (published commits)

@@ -14,7 +14,9 @@ Wrap up so the next session can start from the handoffs alone.
 3. **Handoffs.** Rewrite `handoff/<feature>.md` of each feature (`handoff/main.md` in the main lab)
    as one page: goal, state, open questions, next steps, pointers to the notes that matter.
 4. **Journal and memory.** Durable findings go to `journal.md` (citing the log); anything that
-   should change how future sessions work goes to memory.
+   should change how future sessions work goes to memory. If the main lab has a `status/`, bring
+   each worktree's status up to date (`.cudl/cudl status set -f <feature> <section> "<text>"`;
+   no text removes a section that no longer holds).
 5. **Commit** the lab side of each feature: `.cudl/cudl commit -f <feature> -m "<summary>"` (and
    without `-f` where the session started). This commits the lab and any code already staged; code
    changes you haven't committed yet deserve their own commit and message first.

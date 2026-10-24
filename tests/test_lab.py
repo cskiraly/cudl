@@ -362,6 +362,7 @@ class TestLab(CudlTest):
             return self.sh(str(copy), *args, cwd=cwd or self.w, check=False, input=input, env=env)
 
         for args, cwd in ((("commit", "-m", "x"), None), (("-f", "f1", "commit", "-m", "x"), None),
+                          (("status", "set", "Next", "x"), None),  # status that writes is no look
                           (("upgrade",), None), (("install",), self.root), (("init", str(self.w / "scratch/x")), None)):
             p = run(*args, cwd=cwd)
             self.assertEqual(p.returncode, 1, args)
